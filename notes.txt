@@ -1,0 +1,11 @@
+main guide: https://vkguide.dev/
+
+third party libraries (options):
+- instead of GLM (openGL Mathematics):
+	- zmath (https://github.com/michal-z/zig-gamedev/blob/main/libs/common/zmath.zig)
+	- zalgebra (https://github.com/kooparse/zalgebra)
+- wrappers for imgui
+	- Zig-ImGui (https://github.com/SpexGuy/Zig-ImGui)
+		- out of date?
+	- zig-gamekit/imgui (https://github.com/prime31/zig-gamekit/tree/main/gamekit/imgui)
+	- zig-upaya/deps/imgui (https://github.com/prime31/zig-upaya/tree/master/src/deps/imgui)
