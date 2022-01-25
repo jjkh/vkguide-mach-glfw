@@ -4,11 +4,14 @@ window: glfw.Window,
 instance: vk.Instance,
 
 // debug_messenger: vk.DebugUtilsMessengerEXT, // Vulkan debug output handle
-chosen_gpu: vk.PhysicalDevice, // GPU chosen as the default device
+gpu: PhysicalDevice, // GPU chosen as the default device
 device: vk.Device, // Vulkan device for commands
 surface: vk.SurfaceKHR,
+graphics_queue: Queue,
+present_queue: Queue,
 
 vki: InstanceDispatch,
+vkd: DeviceDispatch,
 
 const Self = @This();
 
@@ -71,12 +74,12 @@ const InstanceDispatch = vk.InstanceWrapper(.{
     .enumerateDeviceExtensionProperties = true,
     .getPhysicalDeviceSurfaceFormatsKHR = true,
     .getPhysicalDeviceSurfacePresentModesKHR = true,
-    // .createDevice = true,
-    // .getPhysicalDeviceSurfaceCapabilitiesKHR = true,
-    // .getPhysicalDeviceQueueFamilyProperties = true,
-    // .getPhysicalDeviceSurfaceSupportKHR = true,
-    // .getPhysicalDeviceMemoryProperties = true,
-    // .getDeviceProcAddr = true,
+    .createDevice = true,
+    .getPhysicalDeviceSurfaceCapabilitiesKHR = true,
+    .getPhysicalDeviceQueueFamilyProperties = true,
+    .getPhysicalDeviceSurfaceSupportKHR = true,
+    .getPhysicalDeviceMemoryProperties = true,
+    .getDeviceProcAddr = true,
 });
 
 fn initVulkan(self: *Self, allocator: Allocator, app_info: AppInfo) !void {
@@ -131,8 +134,11 @@ fn initVulkan(self: *Self, allocator: Allocator, app_info: AppInfo) !void {
     errdefer self.vki.destroySurfaceKHR(self.instance, self.surface, null);
 
     try self.selectPhysicalDevice(allocator);
-    // try self.createDevice();
-    // errdefer self.vkd.destroyDevice(self.device, null);
+    try self.createDevice();
+    errdefer self.vkd.destroyDevice(self.device, null);
+
+    self.graphics_queue = Queue.init(self.vkd, self.device, self.gpu.queues.?.graphics_family);
+    self.present_queue = Queue.init(self.vkd, self.device, self.gpu.queues.?.present_family);
 }
 
 fn createSurface(self: *Self) !void {
@@ -144,6 +150,11 @@ fn createSurface(self: *Self) !void {
     );
     if (result != @enumToInt(vk.Result.success))
         return error.SurfaceInitFailed;
+}
+
+fn cStrToSlice(buf: []const u8) [:0]const u8 {
+    const len = std.mem.indexOfScalar(u8, buf, 0).?;
+    return buf[0..len :0];
 }
 
 fn selectPhysicalDevice(self: *Self, allocator: Allocator) !void {
@@ -159,9 +170,19 @@ fn selectPhysicalDevice(self: *Self, allocator: Allocator) !void {
         physical_devices.ptr,
     );
 
-    for (physical_devices) |physical_device| {
-        if (try self.checkPhysicalDeviceSuitable(allocator, physical_device)) {
-            self.chosen_gpu = physical_device;
+    for (physical_devices) |handle| {
+        var physical_device = PhysicalDevice{
+            .handle = handle,
+            .props = self.vki.getPhysicalDeviceProperties(handle),
+        };
+
+        if (try self.checkPhysicalDeviceSuitable(allocator, &physical_device)) {
+            std.log.info(
+                "found physical device: {s}",
+                .{cStrToSlice(&physical_device.props.device_name)},
+            );
+
+            self.gpu = physical_device;
             return;
         }
     }
@@ -172,22 +193,20 @@ fn selectPhysicalDevice(self: *Self, allocator: Allocator) !void {
 fn checkPhysicalDeviceSuitable(
     self: *Self,
     allocator: Allocator,
-    physical_device: vk.PhysicalDevice,
+    physical_device: *PhysicalDevice,
 ) !bool {
-    const props = self.vki.getPhysicalDeviceProperties(physical_device);
-
-    const len = std.mem.indexOfScalar(u8, &props.device_name, 0).?;
-    std.log.info("found physical device: {s}", .{props.device_name[0..len]});
-
-    if (!try self.checkExtensionSupport(allocator, physical_device))
+    if (!try self.checkExtensionSupport(allocator, physical_device.*))
         return false;
 
-    if (!try self.checkSurfaceSupport(physical_device))
+    if (!try self.checkSurfaceSupport(physical_device.*))
         return false;
 
-    // TODO: are we validating the device supports the vulkan version?
+    // TODO: rename - this doesn't (permanently) allocate!
+    if (!try self.allocateQueues(allocator, physical_device))
+        return false;
 
-    // TODO: triangle sample allocates queues - is this necessary?
+    // TODO: should validate supports vulkan version
+
     return true;
 }
 
@@ -196,11 +215,11 @@ const required_device_extensions = [_][]const u8{vk.extension_info.khr_swapchain
 fn checkExtensionSupport(
     self: *Self,
     allocator: Allocator,
-    physical_device: vk.PhysicalDevice,
+    physical_device: PhysicalDevice,
 ) !bool {
     var prop_count: u32 = undefined;
     _ = try self.vki.enumerateDeviceExtensionProperties(
-        physical_device,
+        physical_device.handle,
         null,
         &prop_count,
         null,
@@ -210,7 +229,7 @@ fn checkExtensionSupport(
     defer allocator.free(props_vec);
 
     _ = try self.vki.enumerateDeviceExtensionProperties(
-        physical_device,
+        physical_device.handle,
         null,
         &prop_count,
         props_vec.ptr,
@@ -218,12 +237,7 @@ fn checkExtensionSupport(
 
     for (required_device_extensions) |extension_name| {
         for (props_vec) |props| {
-            // TODO: can this be done with sentinel slice instead?
-            // e.g. std.mem.len(@ptrCast([*:0]const u8, &props.extension_name))
-            const len = std.mem.indexOfScalar(u8, &props.extension_name, 0).?;
-            const prop_ext_name = props.extension_name[0..len];
-            // TODO: actually, can this whole thing be replaced with std.mem.startsWith?
-            if (std.mem.eql(u8, extension_name, prop_ext_name))
+            if (std.mem.eql(u8, extension_name, cStrToSlice(&props.extension_name)))
                 break;
         } else {
             return false;
@@ -233,10 +247,10 @@ fn checkExtensionSupport(
     return true;
 }
 
-fn checkSurfaceSupport(self: *Self, physical_device: vk.PhysicalDevice) !bool {
+fn checkSurfaceSupport(self: *Self, physical_device: PhysicalDevice) !bool {
     var format_count: u32 = undefined;
     _ = try self.vki.getPhysicalDeviceSurfaceFormatsKHR(
-        physical_device,
+        physical_device.handle,
         self.surface,
         &format_count,
         null,
@@ -245,7 +259,7 @@ fn checkSurfaceSupport(self: *Self, physical_device: vk.PhysicalDevice) !bool {
 
     var present_mode_count: u32 = undefined;
     _ = try self.vki.getPhysicalDeviceSurfacePresentModesKHR(
-        physical_device,
+        physical_device.handle,
         self.surface,
         &present_mode_count,
         null,
@@ -254,3 +268,151 @@ fn checkSurfaceSupport(self: *Self, physical_device: vk.PhysicalDevice) !bool {
 
     return true;
 }
+
+const PhysicalDevice = struct {
+    handle: vk.PhysicalDevice,
+    props: vk.PhysicalDeviceProperties,
+    queues: ?QueueAllocation = null,
+};
+
+const QueueAllocation = struct {
+    graphics_family: u32,
+    present_family: u32,
+
+    pub fn count(self: QueueAllocation) u32 {
+        return if (self.graphics_family == self.present_family) 1 else 2;
+    }
+};
+
+fn allocateQueues(self: *Self, allocator: Allocator, physical_device: *PhysicalDevice) !bool {
+    var family_count: u32 = undefined;
+    self.vki.getPhysicalDeviceQueueFamilyProperties(physical_device.handle, &family_count, null);
+
+    const families = try allocator.alloc(vk.QueueFamilyProperties, family_count);
+    defer allocator.free(families);
+    self.vki.getPhysicalDeviceQueueFamilyProperties(physical_device.handle, &family_count, families.ptr);
+
+    var graphics_family: ?u32 = null;
+    var present_family: ?u32 = null;
+
+    for (families) |props, i| {
+        const family = @intCast(u32, i);
+        const surface_support = try self.vki.getPhysicalDeviceSurfaceSupportKHR(
+            physical_device.handle,
+            family,
+            self.surface,
+        );
+
+        if (graphics_family == null and props.queue_flags.graphics_bit)
+            graphics_family = family;
+
+        if (present_family == null and surface_support == vk.TRUE)
+            present_family = family;
+    }
+
+    if (graphics_family != null and present_family != null) {
+        physical_device.queues = QueueAllocation{
+            .graphics_family = graphics_family.?,
+            .present_family = present_family.?,
+        };
+        return true;
+    }
+
+    return false;
+}
+
+const DeviceDispatch = vk.DeviceWrapper(.{
+    .destroyDevice = true,
+    .getDeviceQueue = true,
+    .createSemaphore = true,
+    .createFence = true,
+    .createImageView = true,
+    .destroyImageView = true,
+    .destroySemaphore = true,
+    .destroyFence = true,
+    .getSwapchainImagesKHR = true,
+    .createSwapchainKHR = true,
+    .destroySwapchainKHR = true,
+    .acquireNextImageKHR = true,
+    .deviceWaitIdle = true,
+    .waitForFences = true,
+    .resetFences = true,
+    .queueSubmit = true,
+    .queuePresentKHR = true,
+    .createCommandPool = true,
+    .destroyCommandPool = true,
+    .allocateCommandBuffers = true,
+    .freeCommandBuffers = true,
+    .queueWaitIdle = true,
+    .createShaderModule = true,
+    .destroyShaderModule = true,
+    .createPipelineLayout = true,
+    .destroyPipelineLayout = true,
+    .createRenderPass = true,
+    .destroyRenderPass = true,
+    .createGraphicsPipelines = true,
+    .destroyPipeline = true,
+    .createFramebuffer = true,
+    .destroyFramebuffer = true,
+    .beginCommandBuffer = true,
+    .endCommandBuffer = true,
+    .allocateMemory = true,
+    .freeMemory = true,
+    .createBuffer = true,
+    .destroyBuffer = true,
+    .getBufferMemoryRequirements = true,
+    .mapMemory = true,
+    .unmapMemory = true,
+    .bindBufferMemory = true,
+    .cmdBeginRenderPass = true,
+    .cmdEndRenderPass = true,
+    .cmdBindPipeline = true,
+    .cmdDraw = true,
+    .cmdSetViewport = true,
+    .cmdSetScissor = true,
+    .cmdBindVertexBuffers = true,
+    .cmdCopyBuffer = true,
+});
+
+fn createDevice(self: *Self) !void {
+    const priority = [_]f32{1};
+    const qci = [_]vk.DeviceQueueCreateInfo{
+        .{
+            .flags = .{},
+            .queue_family_index = self.gpu.queues.?.graphics_family,
+            .queue_count = 1,
+            .p_queue_priorities = &priority,
+        },
+        .{
+            .flags = .{},
+            .queue_family_index = self.gpu.queues.?.present_family,
+            .queue_count = 1,
+            .p_queue_priorities = &priority,
+        },
+    };
+
+    self.device = try self.vki.createDevice(self.gpu.handle, &.{
+        .flags = .{},
+        .queue_create_info_count = self.gpu.queues.?.count(),
+        .p_queue_create_infos = &qci,
+        .enabled_layer_count = 0,
+        .pp_enabled_layer_names = undefined,
+        .enabled_extension_count = required_device_extensions.len,
+        .pp_enabled_extension_names = @ptrCast([*]const [*:0]const u8, &required_device_extensions),
+        .p_enabled_features = null,
+    }, null);
+
+    self.vkd = try DeviceDispatch.load(self.device, self.vki.dispatch.vkGetDeviceProcAddr);
+}
+
+pub const Queue = struct {
+    handle: vk.Queue,
+    family: u32,
+
+    fn init(vkd: DeviceDispatch, dev: vk.Device, family: u32) Queue {
+        return .{
+            .handle = vkd.getDeviceQueue(dev, family, 0),
+            .family = family,
+        };
+    }
+};

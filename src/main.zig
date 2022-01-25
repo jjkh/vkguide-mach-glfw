@@ -6,7 +6,7 @@ const glfw = @import("glfw");
 const Engine = @import("Engine.zig");
 
 pub fn main() !void {
-    var gpa = std.heap.c_allocator(.{ .safety = true }){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
