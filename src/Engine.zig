@@ -19,12 +19,12 @@ const glfw = @import("glfw");
 const Allocator = std.mem.Allocator;
 
 pub const AppInfo = struct {
-    name: []const u8,
+    name: [:0]const u8,
     version: u32 = vk.makeApiVersion(0, 0, 0, 0),
 };
 
 pub const WindowOptions = struct {
-    title: []const u8,
+    title: [:0]const u8,
     extent: vk.Extent2D = .{ .width = 1700, .height = 900 },
 };
 
@@ -59,24 +59,24 @@ pub fn deinit(self: *Self) void {
     glfw.terminate();
 }
 
-const BaseDispatch = vk.BaseWrapper(&.{
-    .createInstance,
+const BaseDispatch = vk.BaseWrapper(.{
+    .createInstance = true,
 });
 
-const InstanceDispatch = vk.InstanceWrapper(&.{
-    .destroyInstance,
-    .destroySurfaceKHR,
-    .enumeratePhysicalDevices,
-    // .getPhysicalDeviceProperties,
-    .enumerateDeviceExtensionProperties,
-    .getPhysicalDeviceSurfaceFormatsKHR,
-    .getPhysicalDeviceSurfacePresentModesKHR,
-    // .createDevice,
-    // .getPhysicalDeviceSurfaceCapabilitiesKHR,
-    // .getPhysicalDeviceQueueFamilyProperties,
-    // .getPhysicalDeviceSurfaceSupportKHR,
-    // .getPhysicalDeviceMemoryProperties,
-    // .getDeviceProcAddr,
+const InstanceDispatch = vk.InstanceWrapper(.{
+    .destroyInstance = true,
+    .destroySurfaceKHR = true,
+    .enumeratePhysicalDevices = true,
+    .getPhysicalDeviceProperties = true,
+    .enumerateDeviceExtensionProperties = true,
+    .getPhysicalDeviceSurfaceFormatsKHR = true,
+    .getPhysicalDeviceSurfacePresentModesKHR = true,
+    // .createDevice = true,
+    // .getPhysicalDeviceSurfaceCapabilitiesKHR = true,
+    // .getPhysicalDeviceQueueFamilyProperties = true,
+    // .getPhysicalDeviceSurfaceSupportKHR = true,
+    // .getPhysicalDeviceMemoryProperties = true,
+    // .getDeviceProcAddr = true,
 });
 
 fn initVulkan(self: *Self, allocator: Allocator, app_info: AppInfo) !void {
@@ -133,8 +133,6 @@ fn initVulkan(self: *Self, allocator: Allocator, app_info: AppInfo) !void {
     try self.selectPhysicalDevice(allocator);
     // try self.createDevice();
     // errdefer self.vkd.destroyDevice(self.device, null);
-
-    return self;
 }
 
 fn createSurface(self: *Self) !void {
@@ -176,6 +174,11 @@ fn checkPhysicalDeviceSuitable(
     allocator: Allocator,
     physical_device: vk.PhysicalDevice,
 ) !bool {
+    const props = self.vki.getPhysicalDeviceProperties(physical_device);
+
+    const len = std.mem.indexOfScalar(u8, &props.device_name, 0).?;
+    std.log.info("found physical device: {s}", .{props.device_name[0..len]});
+
     if (!try self.checkExtensionSupport(allocator, physical_device))
         return false;
 

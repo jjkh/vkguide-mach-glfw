@@ -6,7 +6,11 @@ const glfw = @import("glfw");
 const Engine = @import("Engine.zig");
 
 pub fn main() !void {
-    const engine = Engine.init(.{ .name = "vkguide example" }, .{ .title = "vkguide.dev" });
+    var gpa = std.heap.c_allocator(.{ .safety = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var engine = try Engine.init(allocator, .{ .name = "vkguide example" }, .{ .title = "vkguide.dev" });
     defer engine.deinit();
 
     // Wait for the user to close the window.
