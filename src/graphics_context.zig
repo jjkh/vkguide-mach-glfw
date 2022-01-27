@@ -1,9 +1,13 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const glfw = @import("glfw");
+
 const Allocator = std.mem.Allocator;
 
+const DEBUG = @import("builtin").mode == .Debug;
+
 const required_device_extensions = [_][*:0]const u8{vk.extension_info.khr_swapchain.name};
+const required_instance_extensions = if (DEBUG) [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"} else .{};
 
 const BaseDispatch = vk.BaseWrapper(.{
     .createInstance = true,
@@ -112,8 +116,8 @@ pub const GraphicsContext = struct {
         self.instance = try self.vkb.createInstance(&.{
             .flags = .{},
             .p_application_info = &app_info,
-            .enabled_layer_count = 0,
-            .pp_enabled_layer_names = undefined,
+            .enabled_layer_count = required_instance_extensions.len,
+            .pp_enabled_layer_names = if (required_instance_extensions.len > 0) &required_instance_extensions else undefined,
             .enabled_extension_count = @intCast(u32, glfw_exts.len),
             .pp_enabled_extension_names = @ptrCast([*]const [*:0]const u8, glfw_exts),
         }, null);
