@@ -72,28 +72,33 @@ pub fn main() !void {
     var render_semaphore = try gc.vkd.createSemaphore(gc.dev, &.{ .flags = .{} }, null);
     defer gc.vkd.destroySemaphore(gc.dev, render_semaphore, null);
 
+    // wait until device is idle to start cleanup
+    defer gc.vkd.deviceWaitIdle(gc.dev) catch {};
+
     var frame_number: u32 = 0;
     // Wait for the user to close the window.
     while (!window.shouldClose()) : (frame_number += 1) {
+        const cmdbuf = cmdbufs[0];
+
         // wait until the GPU has finished rendering the last frame. Timeout of 1 second
         _ = try gc.vkd.waitForFences(gc.dev, 1, @ptrCast([*]vk.Fence, &fence), @boolToInt(true), 1_000_000_000);
         try gc.vkd.resetFences(gc.dev, 1, @ptrCast([*]vk.Fence, &fence));
 
+        // now that we are sure that the commands finished executing, we can safely reset the command buffer to begin recording again
+        try gc.vkd.resetCommandBuffer(cmdbuf, .{});
+
         // request image from the swapchain, one second timeout
-        const result = try gc.vkd.acquireNextImageKHR(gc.dev, swapchain.handle, 1_000_000_000, present_semaphore, fence);
+        const result = try gc.vkd.acquireNextImageKHR(gc.dev, swapchain.handle, 1_000_000_000, present_semaphore, .null_handle);
         const image_index = result.image_index;
 
-        // now that we are sure that the commands finished executing, we can safely reset the command buffer to begin recording again
-        try gc.vkd.resetCommandBuffer(cmdbufs[0], .{});
-
         // begin the command buffer recording. We will use this command buffer exactly once, so we want to let Vulkan know that
-        try gc.vkd.beginCommandBuffer(cmdbufs[0], &.{
+        try gc.vkd.beginCommandBuffer(cmdbuf, &.{
             .flags = .{ .one_time_submit_bit = true },
             .p_inheritance_info = null,
         });
 
-        // make a clear-color from frame number. This will flash with a 120*pi frame period
-        const flash = std.math.absFloat(std.math.sin(@intToFloat(f32, frame_number) / 120.0));
+        // make a clear-color from frame number. This will flash with a 12,000*pi frame period
+        const flash = std.math.absFloat(std.math.sin(@intToFloat(f32, frame_number) / 12_000.0));
         const clear_value = [_]vk.ClearValue{.{ .color = .{ .float_32 = .{ 0.0, 0.0, flash, 1.0 } } }};
 
         const rp_begin_info = vk.RenderPassBeginInfo{
@@ -106,12 +111,12 @@ pub fn main() !void {
 
         // start the main renderpass
         // we will use the clear color from above, and the framebuffer of the index the swapchain gave us
-        gc.vkd.cmdBeginRenderPass(cmdbufs[0], &rp_begin_info, .@"inline");
+        gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin_info, .@"inline");
 
         // finalize the render pass
-        gc.vkd.cmdEndRenderPass(cmdbufs[0]);
-        // // finalize the command buffer (we can no longer add commands, but it can now be executed)
-        try gc.vkd.endCommandBuffer(cmdbufs[0]);
+        gc.vkd.cmdEndRenderPass(cmdbuf);
+        // finalize the command buffer (we can no longer add commands, but it can now be executed)
+        try gc.vkd.endCommandBuffer(cmdbuf);
 
         // prepare the submission to the queue.
         // we want to wait on the present_semaphore, as that semaphore is signaled when the swapchain is ready
@@ -123,7 +128,7 @@ pub fn main() !void {
             .command_buffer_count = 1,
             .p_command_buffers = cmdbufs.ptr,
             .signal_semaphore_count = 1,
-            .p_signal_semaphores = @ptrCast([*]const vk.Semaphore, &present_semaphore),
+            .p_signal_semaphores = @ptrCast([*]const vk.Semaphore, &render_semaphore),
         };
         try gc.vkd.queueSubmit(gc.graphics_queue.handle, 1, @ptrCast([*]const vk.SubmitInfo, &submit_info), fence);
 
