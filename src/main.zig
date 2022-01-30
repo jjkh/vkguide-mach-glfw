@@ -8,6 +8,8 @@ const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
 const Allocator = std.mem.Allocator;
 
+var g_selectedShader: enum { red, colored } = .red;
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
     defer _ = gpa.deinit();
@@ -28,6 +30,21 @@ pub fn main() !void {
         .{ .client_api = .no_api },
     );
     defer window.destroy();
+
+    window.setKeyCallback((struct {
+        fn callback(_window: glfw.Window, key: glfw.Key, scancode: i32, action: glfw.Action, mods: glfw.Mods) void {
+            _ = scancode;
+            _ = mods;
+
+            if (action != .press) return;
+
+            switch (key) {
+                .escape => _window.setShouldClose(true),
+                .space => g_selectedShader = if (g_selectedShader == .red) .colored else .red,
+                else => {},
+            }
+        }
+    }).callback);
 
     const gc = try GraphicsContext.init(allocator, "vkguide example", window);
     defer gc.deinit();
@@ -68,8 +85,25 @@ pub fn main() !void {
     const render_pass = try createRenderPass(&gc, swapchain);
     defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
 
-    const pipeline = try createPipeline(&gc, pipeline_layout, render_pass, swapchain.extent);
-    defer gc.vkd.destroyPipeline(gc.dev, pipeline, null);
+    const red_pipeline = try createPipeline(
+        &gc,
+        resources.red_triangle_vert,
+        resources.red_triangle_frag,
+        pipeline_layout,
+        render_pass,
+        swapchain.extent,
+    );
+    defer gc.vkd.destroyPipeline(gc.dev, red_pipeline, null);
+
+    const colored_pipeline = try createPipeline(
+        &gc,
+        resources.colored_triangle_vert,
+        resources.colored_triangle_frag,
+        pipeline_layout,
+        render_pass,
+        swapchain.extent,
+    );
+    defer gc.vkd.destroyPipeline(gc.dev, colored_pipeline, null);
 
     var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
     defer {
@@ -126,7 +160,7 @@ pub fn main() !void {
         // we will use the clear color from above, and the framebuffer of the index the swapchain gave us
         gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin_info, .@"inline");
 
-        gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
+        gc.vkd.cmdBindPipeline(cmdbuf, .graphics, if (g_selectedShader == .red) red_pipeline else colored_pipeline);
         gc.vkd.cmdDraw(cmdbuf, 3, 1, 0, 0);
 
         // finalize the render pass
@@ -244,14 +278,16 @@ fn loadShaderModule(gc: *const GraphicsContext, shader: []const u8) !vk.ShaderMo
 
 fn createPipeline(
     gc: *const GraphicsContext,
+    vert_shader: []const u8,
+    frag_shader: []const u8,
     layout: vk.PipelineLayout,
     render_pass: vk.RenderPass,
     extent: vk.Extent2D,
 ) !vk.Pipeline {
-    const vert = try loadShaderModule(gc, resources.triangle_vert);
+    const vert = try loadShaderModule(gc, vert_shader);
     defer gc.vkd.destroyShaderModule(gc.dev, vert, null);
 
-    const frag = try loadShaderModule(gc, resources.triangle_frag);
+    const frag = try loadShaderModule(gc, frag_shader);
     defer gc.vkd.destroyShaderModule(gc.dev, frag, null);
     // build the stage_create_info for both vertex and fragment stages.
     // this lets the pipeline know the shader modules per stage
