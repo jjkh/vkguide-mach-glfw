@@ -10,3 +10,6 @@
 [submodule "deps/zva"]
 	path = deps/zva
 	url = https://github.com/jjkh/zva
+[submodule "deps/zlm"]
+	path = deps/zlm
+	url = https://github.com/ziglibs/zlm

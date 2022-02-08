@@ -21,6 +21,9 @@ pub fn build(b: *std.build.Builder) void {
     exe.setBuildMode(mode);
     exe.install();
 
+    // zlm (zig linear maths library)
+    exe.addPackagePath("zlm", "deps/zlm/zlm.zig");
+
     // vulkan-zig: Create a step that generates vk.zig (stored in zig-cache) from the provided vulkan registry.
     const gen = vkgen.VkGenerateStep.init(b, "deps/vulkan-zig/examples/vk.xml", "vk.zig");
     exe.addPackage(gen.package);
