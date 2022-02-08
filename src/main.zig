@@ -3,12 +3,25 @@ const std = @import("std");
 const vk = @import("vulkan");
 const glfw = @import("glfw");
 const resources = @import("resources");
+const zva = @import("zva");
 
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
 const Allocator = std.mem.Allocator;
 
+pub const c = @cImport({
+    @cInclude("ft2build.h");
+    @cInclude("freetype/freetype.h");
+});
+
 var g_selectedShader: enum { red, colored } = .red;
+
+const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
+
+const AllocatedBuffer = struct {
+    buffer: vk.Buffer,
+    allocation: zva.Allocation,
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
@@ -17,6 +30,37 @@ pub fn main() !void {
 
     try glfw.init(.{});
     errdefer glfw.terminate();
+
+    // var ft_handle: c.FT_Library = undefined;
+    // {
+    //     const status = c.FT_Init_FreeType(&ft_handle);
+    //     if (status > 0) {
+    //         std.debug.print("freetype init failed with code {}\n", .{status});
+    //         return error.FreeTypeInitFailed;
+    //     }
+    // }
+    // defer _ = c.FT_Done_FreeType(ft_handle);
+
+    // var ft_face: c.FT_Face = undefined;
+    // {
+    //     const status = c.FT_New_Memory_Face(ft_handle, font_file, font_file.len, 0, &ft_face);
+    //     if (status > 0) {
+    //         std.debug.print("font load failed with code {}\n", .{status});
+    //         return error.FreeTypeInitFailed;
+    //     }
+    // }
+    // defer _ = c.FT_Done_Face(ft_face);
+
+    // _ = c.FT_Set_Pixel_Sizes(ft_face, 0, 48);
+
+    // {
+    //     const status = c.FT_Load_Char(ft_face, 'x', c.FT_LOAD_RENDER);
+    //     if (status > 0) {
+    //         std.debug.print("glyph 'x' load failed with code {}\n", .{status});
+    //         return error.FreeTypeInitFailed;
+    //     }
+    // }
+    // defer _ = c.FT_Done_Face(ft_face);
 
     var extent = vk.Extent2D{ .width = 800, .height = 600 };
 
@@ -36,7 +80,7 @@ pub fn main() !void {
             _ = scancode;
             _ = mods;
 
-            if (action != .press) return;
+            if (action != .press and action != .repeat) return;
 
             switch (key) {
                 .escape => _window.setShouldClose(true),
@@ -50,6 +94,17 @@ pub fn main() !void {
     defer gc.deinit();
 
     std.debug.print("Using device: {s}\n", .{gc.deviceName()});
+
+    const v_alloc = try zva.Allocator.init(allocator, .{
+        .getPhysicalDeviceProperties = gc.vki.dispatch.vkGetPhysicalDeviceProperties,
+        .getPhysicalDeviceMemoryProperties = gc.vki.dispatch.vkGetPhysicalDeviceMemoryProperties,
+
+        .allocateMemory = gc.vkd.dispatch.vkAllocateMemory,
+        .freeMemory = gc.vkd.dispatch.vkFreeMemory,
+        .mapMemory = gc.vkd.dispatch.vkMapMemory,
+        .unmapMemory = gc.vkd.dispatch.vkUnmapMemory,
+    }, gc.pdev, gc.dev, 128);
+    defer v_alloc.deinit();
 
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();

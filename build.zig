@@ -1,8 +1,9 @@
 const std = @import("std");
 
-const glfw = @import("libs/mach-glfw/build.zig");
-const vkgen = @import("libs/vulkan-zig/generator/index.zig");
-const zigvulkan = @import("libs/vulkan-zig/build.zig");
+const glfw = @import("deps/mach-glfw/build.zig");
+
+const vkgen = @import("deps/vulkan-zig/generator/index.zig");
+const zigvulkan = @import("deps/vulkan-zig/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
     // Standard target options allows the person running `zig build` to choose
@@ -21,11 +22,15 @@ pub fn build(b: *std.build.Builder) void {
     exe.install();
 
     // vulkan-zig: Create a step that generates vk.zig (stored in zig-cache) from the provided vulkan registry.
-    const gen = vkgen.VkGenerateStep.init(b, "libs/vulkan-zig/examples/vk.xml", "vk.zig");
+    const gen = vkgen.VkGenerateStep.init(b, "deps/vulkan-zig/examples/vk.xml", "vk.zig");
     exe.addPackage(gen.package);
 
+    // zva (zig vulkan allocator)
+    const zva = @import("deps/zva/pkg.zig").Pkg("deps/zva", "zig-cache/vk.zig");
+    exe.addPackage(zva.pkg);
+
     // mach-glfw
-    exe.addPackagePath("glfw", "libs/mach-glfw/src/main.zig");
+    exe.addPackagePath("glfw", "deps/mach-glfw/src/main.zig");
     glfw.link(b, exe, .{});
 
     // shader resources, to be compiled using glslc
@@ -35,6 +40,11 @@ pub fn build(b: *std.build.Builder) void {
     res.addShader("colored_triangle_vert", "shaders/colored_triangle.vert");
     res.addShader("colored_triangle_frag", "shaders/colored_triangle.frag");
     exe.addPackage(res.package);
+
+    // freetype
+    exe.linkLibC();
+    exe.addIncludeDir("deps/freetype/include");
+    exe.addObjectFile("deps/freetype/lib/win-x64-gnu/freetype.a");
 
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());

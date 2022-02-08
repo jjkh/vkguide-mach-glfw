@@ -1,6 +1,12 @@
-[submodule "libs/mach-glfw"]
-	path = libs/mach-glfw
+[submodule "deps/mach-glfw"]
+	path = deps/mach-glfw
 	url = https://github.com/hexops/mach-glfw
-[submodule "libs/vulkan-zig"]
-	path = libs/vulkan-zig
+[submodule "deps/vulkan-zig"]
+	path = deps/vulkan-zig
 	url = https://github.com/Snektron/vulkan-zig
+[submodule "deps/techna-sans"]
+	path = deps/techna-sans
+	url = https://github.com/carlstype/techna-sans
+[submodule "deps/zva"]
+	path = deps/zva
+	url = https://github.com/jjkh/zva
