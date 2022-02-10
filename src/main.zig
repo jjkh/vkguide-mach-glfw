@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const vk = @import("vulkan");
 const glfw = @import("glfw");
@@ -7,20 +8,26 @@ const zva = @import("zva");
 
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
-const Allocator = std.mem.Allocator;
+const Mesh = @import("Mesh.zig");
+const Vertex = Mesh.Vertex;
 
 pub const c = @cImport({
     @cInclude("ft2build.h");
     @cInclude("freetype/freetype.h");
 });
 
-var g_selectedShader: enum { red, colored } = .red;
+var g_selectedShader: enum { red, colored, mesh } = .red;
 
 const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
 
 const AllocatedBuffer = struct {
     buffer: vk.Buffer,
     allocation: zva.Allocation,
+
+    pub fn deinit(self: *AllocatedBuffer, gc: *const GraphicsContext, vma: *zva.Allocator) void {
+        gc.vkd.destroyBuffer(gc.dev, self.buffer, null);
+        vma.free(self.allocation);
+    }
 };
 
 pub fn main() !void {
@@ -84,7 +91,11 @@ pub fn main() !void {
 
             switch (key) {
                 .escape => _window.setShouldClose(true),
-                .space => g_selectedShader = if (g_selectedShader == .red) .colored else .red,
+                .space => g_selectedShader = switch (g_selectedShader) {
+                    .red => .colored,
+                    .colored => .mesh,
+                    .mesh => .red,
+                },
                 else => {},
             }
         }
@@ -95,7 +106,7 @@ pub fn main() !void {
 
     std.debug.print("Using device: {s}\n", .{gc.deviceName()});
 
-    const v_alloc = try zva.Allocator.init(allocator, .{
+    var vma = try zva.Allocator.init(allocator, .{
         .getPhysicalDeviceProperties = gc.vki.dispatch.vkGetPhysicalDeviceProperties,
         .getPhysicalDeviceMemoryProperties = gc.vki.dispatch.vkGetPhysicalDeviceMemoryProperties,
 
@@ -104,7 +115,7 @@ pub fn main() !void {
         .mapMemory = gc.vkd.dispatch.vkMapMemory,
         .unmapMemory = gc.vkd.dispatch.vkUnmapMemory,
     }, gc.pdev, gc.dev, 128);
-    defer v_alloc.deinit();
+    defer vma.deinit();
 
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
@@ -128,6 +139,15 @@ pub fn main() !void {
     }, cmdbufs.ptr);
     defer gc.vkd.freeCommandBuffers(gc.dev, pool, @truncate(u32, cmdbufs.len), cmdbufs.ptr);
 
+    // define the triangle mesh for the mesh shader pipeline
+    var mesh = Mesh.init(allocator);
+    defer mesh.deinit();
+
+    try mesh.loadTriangle();
+    var buffer = try uploadMesh(&gc, &vma, mesh);
+    defer buffer.deinit(&gc, &vma);
+
+    // define the pipelines and render pass
     const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
         .flags = .{},
         .set_layout_count = 0,
@@ -140,6 +160,7 @@ pub fn main() !void {
     const render_pass = try createRenderPass(&gc, swapchain);
     defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
 
+    // solid red triangle
     const red_pipeline = try createPipeline(
         &gc,
         resources.red_triangle_vert,
@@ -147,9 +168,11 @@ pub fn main() !void {
         pipeline_layout,
         render_pass,
         swapchain.extent,
+        .{},
     );
     defer gc.vkd.destroyPipeline(gc.dev, red_pipeline, null);
 
+    // interpolated color triangle
     const colored_pipeline = try createPipeline(
         &gc,
         resources.colored_triangle_vert,
@@ -157,8 +180,21 @@ pub fn main() !void {
         pipeline_layout,
         render_pass,
         swapchain.extent,
+        .{},
     );
     defer gc.vkd.destroyPipeline(gc.dev, colored_pipeline, null);
+
+    // mesh vertices, using colored triangle interpolation
+    const mesh_pipeline = try createPipeline(
+        &gc,
+        resources.mesh_triangle_vert,
+        resources.colored_triangle_frag,
+        pipeline_layout,
+        render_pass,
+        swapchain.extent,
+        .{ .vert_input_desc = Vertex.desc() },
+    );
+    defer gc.vkd.destroyPipeline(gc.dev, mesh_pipeline, null);
 
     var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
     defer {
@@ -215,8 +251,18 @@ pub fn main() !void {
         // we will use the clear color from above, and the framebuffer of the index the swapchain gave us
         gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin_info, .@"inline");
 
-        gc.vkd.cmdBindPipeline(cmdbuf, .graphics, if (g_selectedShader == .red) red_pipeline else colored_pipeline);
-        gc.vkd.cmdDraw(cmdbuf, 3, 1, 0, 0);
+        gc.vkd.cmdBindPipeline(cmdbuf, .graphics, switch (g_selectedShader) {
+            .red => red_pipeline,
+            .colored => colored_pipeline,
+            .mesh => mesh_pipeline,
+        });
+
+        if (g_selectedShader == .mesh) {
+            gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast([*]const vk.Buffer, &buffer.buffer), &[_]vk.DeviceSize{0});
+            gc.vkd.cmdDraw(cmdbuf, @intCast(u32, mesh.vertices.items.len), 1, 0, 0);
+        } else {
+            gc.vkd.cmdDraw(cmdbuf, 3, 1, 0, 0);
+        }
 
         // finalize the render pass
         gc.vkd.cmdEndRenderPass(cmdbuf);
@@ -330,6 +376,9 @@ fn loadShaderModule(gc: *const GraphicsContext, shader: []const u8) !vk.ShaderMo
         .p_code = @ptrCast([*]const u32, @alignCast(4, shader)),
     }, null);
 }
+const CreatePipelineOptions = struct {
+    vert_input_desc: ?Mesh.VertexInputDescription = null,
+};
 
 fn createPipeline(
     gc: *const GraphicsContext,
@@ -338,6 +387,7 @@ fn createPipeline(
     layout: vk.PipelineLayout,
     render_pass: vk.RenderPass,
     extent: vk.Extent2D,
+    opts: CreatePipelineOptions,
 ) !vk.Pipeline {
     const vert = try loadShaderModule(gc, vert_shader);
     defer gc.vkd.destroyShaderModule(gc.dev, vert, null);
@@ -364,13 +414,12 @@ fn createPipeline(
     };
 
     // vertex input controls how to read vertices from vertex buffers
-    // currently unused
     const vertex_input_info = vk.PipelineVertexInputStateCreateInfo{
         .flags = .{},
-        .vertex_binding_description_count = 0,
-        .p_vertex_binding_descriptions = undefined,
-        .vertex_attribute_description_count = 0,
-        .p_vertex_attribute_descriptions = undefined,
+        .vertex_binding_description_count = if (opts.vert_input_desc) |vid| @intCast(u32, vid.bindings.len) else 0,
+        .p_vertex_binding_descriptions = if (opts.vert_input_desc) |vid| vid.bindings.ptr else undefined,
+        .vertex_attribute_description_count = if (opts.vert_input_desc) |vid| @intCast(u32, vid.attributes.len) else 0,
+        .p_vertex_attribute_descriptions = if (opts.vert_input_desc) |vid| vid.attributes.ptr else undefined,
     };
 
     // input assembly is the configuration for drawing triangle lists, strips, or individual points.
@@ -486,4 +535,32 @@ fn createPipeline(
         @ptrCast([*]vk.Pipeline, &pipeline),
     );
     return pipeline;
+}
+
+fn uploadMesh(gc: *const GraphicsContext, vma: *zva.Allocator, mesh: Mesh) !AllocatedBuffer {
+    const buffer_info = vk.BufferCreateInfo{
+        .flags = .{},
+        .size = mesh.vertices.items.len * @sizeOf(Vertex),
+        .usage = .{ .vertex_buffer_bit = true },
+        .sharing_mode = .exclusive,
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = undefined,
+    };
+
+    const buffer = try gc.vkd.createBuffer(gc.dev, &buffer_info, null);
+    errdefer gc.vkd.destroyBuffer(gc.dev, buffer, null);
+
+    const mem_req = gc.vkd.getBufferMemoryRequirements(gc.dev, buffer);
+    var allocation = try vma.alloc(
+        mem_req.size,
+        mem_req.alignment,
+        mem_req.memory_type_bits,
+        .CpuToGpu,
+        .Buffer,
+    );
+    errdefer vma.free(allocation);
+    try gc.vkd.bindBufferMemory(gc.dev, buffer, allocation.memory, allocation.offset);
+    std.mem.copy(u8, allocation.data, std.mem.sliceAsBytes(mesh.vertices.items));
+
+    return AllocatedBuffer{ .buffer = buffer, .allocation = allocation };
 }
