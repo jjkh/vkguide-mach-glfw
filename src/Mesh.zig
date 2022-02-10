@@ -67,8 +67,8 @@ pub fn deinit(self: *Mesh) void {
 
 pub fn loadTriangle(self: *Mesh) !void {
     try self.vertices.appendSlice(&[_]Vertex{
-        .{ .position = Vec3.new(0.8, 0.8, 0), .color = Vec3.new(0, 1, 0) },
-        .{ .position = Vec3.new(-0.8, 0.8, 0), .color = Vec3.new(0, 1, 0) },
-        .{ .position = Vec3.new(0, -0.8, 0), .color = Vec3.new(0, 1, 0) },
+        .{ .position = Vec3.new(1, 1, 0), .color = Vec3.new(1, 0, 0) },
+        .{ .position = Vec3.new(-1, 1, 0), .color = Vec3.new(0, 1, 0) },
+        .{ .position = Vec3.new(0, -1, 0), .color = Vec3.new(0, 0, 1) },
     });
 }

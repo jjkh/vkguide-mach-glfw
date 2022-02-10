@@ -5,18 +5,31 @@ const vk = @import("vulkan");
 const glfw = @import("glfw");
 const resources = @import("resources");
 const zva = @import("zva");
+const zlm = @import("zlm");
 
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
 const Mesh = @import("Mesh.zig");
 const Vertex = Mesh.Vertex;
 
+const vec3 = zlm.vec3;
+const Vec3 = zlm.Vec3;
+const Vec4 = zlm.Vec4;
+const Mat4 = zlm.Mat4;
+
+pub const PushConstants = struct {
+    data: Vec4,
+    render_matrix: Mat4,
+};
+
 pub const c = @cImport({
     @cInclude("ft2build.h");
     @cInclude("freetype/freetype.h");
 });
 
-var g_selectedShader: enum { red, colored, mesh } = .red;
+var g_selectedShader: enum { red, colored, mesh } = .mesh;
+
+var cam_pos = vec3(0, 0, 2);
 
 const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
 
@@ -96,6 +109,10 @@ pub fn main() !void {
                     .colored => .mesh,
                     .mesh => .red,
                 },
+                .w => cam_pos.z += 0.01,
+                .s => cam_pos.z -= 0.01,
+                .a => cam_pos.x -= 0.01,
+                .d => cam_pos.x += 0.01,
                 else => {},
             }
         }
@@ -184,12 +201,28 @@ pub fn main() !void {
     );
     defer gc.vkd.destroyPipeline(gc.dev, colored_pipeline, null);
 
+    // mesh gets its own pipeline layout to allow for push constants
+    const push_constant = vk.PushConstantRange{
+        .stage_flags = .{ .vertex_bit = true },
+        .offset = 0,
+        .size = @sizeOf(PushConstants),
+    };
+
+    const mesh_pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
+        .flags = .{},
+        .set_layout_count = 0,
+        .p_set_layouts = undefined,
+        .push_constant_range_count = 1,
+        .p_push_constant_ranges = @ptrCast([*]const vk.PushConstantRange, &push_constant),
+    }, null);
+    defer gc.vkd.destroyPipelineLayout(gc.dev, mesh_pipeline_layout, null);
+
     // mesh vertices, using colored triangle interpolation
     const mesh_pipeline = try createPipeline(
         &gc,
         resources.mesh_triangle_vert,
         resources.colored_triangle_frag,
-        pipeline_layout,
+        mesh_pipeline_layout,
         render_pass,
         swapchain.extent,
         .{ .vert_input_desc = Vertex.desc() },
@@ -259,6 +292,36 @@ pub fn main() !void {
 
         if (g_selectedShader == .mesh) {
             gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast([*]const vk.Buffer, &buffer.buffer), &[_]vk.DeviceSize{0});
+
+            // make a model view matrix for rendering the object
+            const rot_mat = Mat4.createAngleAxis(vec3(0, 1, 0), zlm.toRadians(@intToFloat(f32, frame_number) * 0.04));
+
+            const view = Mat4.createTranslation(cam_pos);
+            var projection = Mat4.createPerspective(
+                zlm.toRadians(60.0),
+                800.0 / 600.0,
+                0.1,
+                200.0,
+            );
+            projection.fields[1][1] *= -1;
+
+            // calculate final mesh matrix
+            const mesh_matrix = rot_mat.mul(view.mul(projection));
+            std.log.debug("{}", .{mesh_matrix});
+
+            const constants = PushConstants{
+                .data = Vec4.zero,
+                .render_matrix = mesh_matrix,
+            };
+            gc.vkd.cmdPushConstants(
+                cmdbuf,
+                mesh_pipeline_layout,
+                .{ .vertex_bit = true },
+                0,
+                @sizeOf(PushConstants),
+                std.mem.asBytes(&constants),
+            );
+
             gc.vkd.cmdDraw(cmdbuf, @intCast(u32, mesh.vertices.items.len), 1, 0, 0);
         } else {
             gc.vkd.cmdDraw(cmdbuf, 3, 1, 0, 0);
