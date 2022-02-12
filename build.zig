@@ -38,11 +38,11 @@ pub fn build(b: *std.build.Builder) void {
 
     // shader resources, to be compiled using glslc
     const res = zigvulkan.ResourceGenStep.init(b, "resources.zig");
-    res.addShader("red_triangle_vert", "shaders/red_triangle.vert");
-    res.addShader("red_triangle_frag", "shaders/red_triangle.frag");
-    res.addShader("colored_triangle_vert", "shaders/colored_triangle.vert");
-    res.addShader("colored_triangle_frag", "shaders/colored_triangle.frag");
-    res.addShader("mesh_triangle_vert", "shaders/mesh_triangle.vert");
+    res.addShader("red_triangle_vert", "assets/shaders/red_triangle.vert");
+    res.addShader("red_triangle_frag", "assets/shaders/red_triangle.frag");
+    res.addShader("colored_triangle_vert", "assets/shaders/colored_triangle.vert");
+    res.addShader("colored_triangle_frag", "assets/shaders/colored_triangle.frag");
+    res.addShader("mesh_triangle_vert", "assets/shaders/mesh_triangle.vert");
     exe.addPackage(res.package);
 
     // freetype
@@ -50,11 +50,22 @@ pub fn build(b: *std.build.Builder) void {
     exe.addIncludeDir("deps/freetype/include");
     exe.addObjectFile("deps/freetype/lib/win-x64-gnu/freetype.a");
 
+    // tinyobjloader-c
+    exe.addIncludeDir("deps/tinyobjloader-c");
+    exe.addCSourceFile("deps/tinyobj_loader_c_impl.c", &[_][]const u8{"-fno-lto"});
+
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // copy model resources to output folder
+    b.installDirectory(.{
+        .source_dir = "assets/models",
+        .install_dir = .bin,
+        .install_subdir = "assets/models",
+    });
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
@@ -62,6 +73,10 @@ pub fn build(b: *std.build.Builder) void {
     const exe_tests = b.addTest("src/main.zig");
     exe_tests.setTarget(target);
     exe_tests.setBuildMode(mode);
+    exe_tests.addPackagePath("zlm", "deps/zlm/zlm.zig");
+    exe_tests.linkLibC();
+    exe_tests.addIncludeDir("deps/tinyobjloader-c");
+    exe_tests.addCSourceFile("deps/tinyobj_loader_c_impl.c", &[_][]const u8{"-fno-lto"});
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&exe_tests.step);

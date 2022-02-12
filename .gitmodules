@@ -13,3 +13,6 @@
 [submodule "deps/zlm"]
 	path = deps/zlm
 	url = https://github.com/ziglibs/zlm
+[submodule "deps/tinyobjloader-c"]
+	path = deps/tinyobjloader-c
+	url = https://github.com/syoyo/tinyobjloader-c

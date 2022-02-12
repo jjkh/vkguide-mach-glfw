@@ -29,8 +29,6 @@ pub const c = @cImport({
 
 var g_selectedShader: enum { red, colored, mesh } = .mesh;
 
-var cam_pos = vec3(0, 0, 2);
-
 const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
 
 const AllocatedBuffer = struct {
@@ -109,10 +107,6 @@ pub fn main() !void {
                     .colored => .mesh,
                     .mesh => .red,
                 },
-                .w => cam_pos.z += 0.01,
-                .s => cam_pos.z -= 0.01,
-                .a => cam_pos.x -= 0.01,
-                .d => cam_pos.x += 0.01,
                 else => {},
             }
         }
@@ -160,7 +154,9 @@ pub fn main() !void {
     var mesh = Mesh.init(allocator);
     defer mesh.deinit();
 
-    try mesh.loadTriangle();
+    // try mesh.loadTriangle();
+    try mesh.loadObj("assets/models/suzanne.obj");
+    // try mesh.loadObj("C:/temp/test.obj");
     var buffer = try uploadMesh(&gc, &vma, mesh);
     defer buffer.deinit(&gc, &vma);
 
@@ -294,7 +290,8 @@ pub fn main() !void {
             gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast([*]const vk.Buffer, &buffer.buffer), &[_]vk.DeviceSize{0});
 
             // make a model view matrix for rendering the object
-            const rot_mat = Mat4.createAngleAxis(vec3(0, 1, 0), zlm.toRadians(@intToFloat(f32, frame_number) * 0.04));
+            const cam_pos = vec3(0, 0, 2);
+            const rot_mat = Mat4.createAngleAxis(vec3(0, 1, 0), zlm.toRadians(@intToFloat(f32, frame_number) * 0.01));
 
             const view = Mat4.createTranslation(cam_pos);
             var projection = Mat4.createPerspective(
@@ -307,7 +304,7 @@ pub fn main() !void {
 
             // calculate final mesh matrix
             const mesh_matrix = rot_mat.mul(view.mul(projection));
-            std.log.debug("{}", .{mesh_matrix});
+            // std.log.debug("{}", .{mesh_matrix});
 
             const constants = PushConstants{
                 .data = Vec4.zero,
@@ -626,4 +623,10 @@ fn uploadMesh(gc: *const GraphicsContext, vma: *zva.Allocator, mesh: Mesh) !Allo
     std.mem.copy(u8, allocation.data, std.mem.sliceAsBytes(mesh.vertices.items));
 
     return AllocatedBuffer{ .buffer = buffer, .allocation = allocation };
+}
+
+test "load obj mesh" {
+    var mesh = Mesh.init(std.testing.allocator);
+    defer mesh.deinit();
+    try mesh.loadObj("C:/temp/test.obj");
 }
