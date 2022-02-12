@@ -31,12 +31,121 @@ var g_selectedShader: enum { red, colored, mesh } = .mesh;
 
 const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
 
-const AllocatedBuffer = struct {
+const Buffer = struct {
     buffer: vk.Buffer,
     allocation: zva.Allocation,
 
-    pub fn deinit(self: *AllocatedBuffer, gc: *const GraphicsContext, vma: *zva.Allocator) void {
+    pub fn uploadMesh(gc: *const GraphicsContext, vma: *zva.Allocator, mesh: Mesh) !Buffer {
+        const buffer_info = vk.BufferCreateInfo{
+            .flags = .{},
+            .size = mesh.vertices.items.len * @sizeOf(Vertex),
+            .usage = .{ .vertex_buffer_bit = true },
+            .sharing_mode = .exclusive,
+            .queue_family_index_count = 0,
+            .p_queue_family_indices = undefined,
+        };
+
+        const buffer = try gc.vkd.createBuffer(gc.dev, &buffer_info, null);
+        errdefer gc.vkd.destroyBuffer(gc.dev, buffer, null);
+
+        const mem_req = gc.vkd.getBufferMemoryRequirements(gc.dev, buffer);
+        var allocation = try vma.alloc(
+            mem_req.size,
+            mem_req.alignment,
+            mem_req.memory_type_bits,
+            .CpuToGpu,
+            .Buffer,
+            .{},
+        );
+        errdefer vma.free(allocation);
+        try gc.vkd.bindBufferMemory(gc.dev, buffer, allocation.memory, allocation.offset);
+        std.mem.copy(u8, allocation.data, std.mem.sliceAsBytes(mesh.vertices.items));
+
+        return Buffer{ .buffer = buffer, .allocation = allocation };
+    }
+
+    pub fn free(self: *Buffer, gc: *const GraphicsContext, vma: *zva.Allocator) void {
         gc.vkd.destroyBuffer(gc.dev, self.buffer, null);
+        vma.free(self.allocation);
+    }
+};
+
+const Image = struct {
+    image: vk.Image,
+    view: vk.ImageView,
+    allocation: zva.Allocation,
+
+    pub fn create(
+        gc: *const GraphicsContext,
+        vma: *zva.Allocator,
+        format: vk.Format,
+        usage_flags: vk.ImageUsageFlags,
+        aspect_flags: vk.ImageAspectFlags,
+        extent: vk.Extent3D,
+    ) !Image {
+        // create the image
+        const image = try gc.vkd.createImage(gc.dev, &.{
+            .flags = .{},
+            .image_type = .@"2d",
+
+            .format = format,
+            .extent = extent,
+
+            .mip_levels = 1,
+            .array_layers = 1,
+            .samples = .{ .@"1_bit" = true },
+            .tiling = .optimal,
+            .usage = usage_flags,
+            .sharing_mode = .exclusive,
+
+            .queue_family_index_count = 0,
+            .p_queue_family_indices = undefined,
+            .initial_layout = .@"undefined",
+        }, null);
+        errdefer gc.vkd.destroyImage(gc.dev, image, null);
+
+        // allocate the image
+        const mem_req = gc.vkd.getImageMemoryRequirements(gc.dev, image);
+        var allocation = try vma.alloc(
+            mem_req.size,
+            mem_req.alignment,
+            mem_req.memory_type_bits,
+            .GpuOnly,
+            .ImageOptimal,
+            .{ .device_local_bit = true },
+        );
+        errdefer vma.free(allocation);
+
+        try gc.vkd.bindImageMemory(gc.dev, image, allocation.memory, allocation.offset);
+
+        // create the image-view
+        const view = try gc.vkd.createImageView(gc.dev, &vk.ImageViewCreateInfo{
+            .flags = .{},
+            .image = image,
+            .view_type = .@"2d",
+            .format = format,
+            .components = .{
+                .r = .identity,
+                .g = .identity,
+                .b = .identity,
+                .a = .identity,
+            },
+            .subresource_range = .{
+                .aspect_mask = aspect_flags,
+                .base_mip_level = 0,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+        }, null);
+        errdefer gc.vkd.destroyImageView(gc.dev, view, null);
+
+        return Image{ .image = image, .view = view, .allocation = allocation };
+    }
+
+    pub fn free(self: *Image, gc: *const GraphicsContext, vma: *zva.Allocator) void {
+        gc.vkd.destroyImageView(gc.dev, self.view, null);
+        gc.vkd.destroyImage(gc.dev, self.image, null);
         vma.free(self.allocation);
     }
 };
@@ -156,9 +265,9 @@ pub fn main() !void {
 
     // try mesh.loadTriangle();
     try mesh.loadObj("assets/models/suzanne.obj");
-    // try mesh.loadObj("C:/temp/test.obj");
-    var buffer = try uploadMesh(&gc, &vma, mesh);
-    defer buffer.deinit(&gc, &vma);
+    // try mesh.loadObj("assets/models/box.obj");
+    var buffer = try Buffer.uploadMesh(&gc, &vma, mesh);
+    defer buffer.free(&gc, &vma);
 
     // define the pipelines and render pass
     const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
@@ -170,7 +279,7 @@ pub fn main() !void {
     }, null);
     defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
 
-    const render_pass = try createRenderPass(&gc, swapchain);
+    const render_pass = try createRenderPass(&gc, swapchain, .d32_sfloat);
     defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
 
     // solid red triangle
@@ -225,7 +334,21 @@ pub fn main() !void {
     );
     defer gc.vkd.destroyPipeline(gc.dev, mesh_pipeline, null);
 
-    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
+    var depth_image = try Image.create(
+        &gc,
+        &vma,
+        .d32_sfloat,
+        .{ .depth_stencil_attachment_bit = true },
+        .{ .depth_bit = true },
+        .{
+            .width = swapchain.extent.width,
+            .height = swapchain.extent.height,
+            .depth = 1,
+        },
+    );
+    defer depth_image.free(&gc, &vma);
+
+    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth_image.view);
     defer {
         for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
         allocator.free(framebuffers);
@@ -266,14 +389,17 @@ pub fn main() !void {
 
         // make a clear-color from frame number. This will flash with a 12,000*pi frame period
         const flash = std.math.absFloat(std.math.sin(@intToFloat(f32, frame_number) / 12_000.0));
-        const clear_value = [_]vk.ClearValue{.{ .color = .{ .float_32 = .{ 0.0, 0.0, flash, 1.0 } } }};
+        const clear_value = vk.ClearValue{ .color = .{ .float_32 = .{ 0.0, 0.0, flash, 1.0 } } };
+
+        // clear depth at 1
+        const depth_clear = vk.ClearValue{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } };
 
         const rp_begin_info = vk.RenderPassBeginInfo{
             .render_pass = render_pass,
             .framebuffer = framebuffers[image_index],
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
-            .clear_value_count = 1,
-            .p_clear_values = &clear_value,
+            .clear_value_count = 2,
+            .p_clear_values = &[_]vk.ClearValue{ clear_value, depth_clear },
         };
 
         // start the main renderpass
@@ -290,8 +416,10 @@ pub fn main() !void {
             gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast([*]const vk.Buffer, &buffer.buffer), &[_]vk.DeviceSize{0});
 
             // make a model view matrix for rendering the object
-            const cam_pos = vec3(0, 0, 2);
+            const cam_pos = vec3(0, -0.2, 2);
             const rot_mat = Mat4.createAngleAxis(vec3(0, 1, 0), zlm.toRadians(@intToFloat(f32, frame_number) * 0.01));
+            // const rot_mat_2 = Mat4.createAngleAxis(vec3(1, 0, 0), 2);
+            // const rot_mat_2 = Mat4.createLookAt(cam_pos, vec3(0, 0, 0), vec3(0, 1, 0));
 
             const view = Mat4.createTranslation(cam_pos);
             var projection = Mat4.createPerspective(
@@ -359,7 +487,7 @@ pub fn main() !void {
     }
 }
 
-fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain) !vk.RenderPass {
+fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain, depth_format: vk.Format) !vk.RenderPass {
     // the renderpass will use this color attachment
     const color_attachment = vk.AttachmentDescription{
         .flags = .{},
@@ -381,6 +509,24 @@ fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain) !vk.Render
         .layout = .color_attachment_optimal,
     };
 
+    const depth_attachment = vk.AttachmentDescription{
+        .flags = .{},
+        .format = depth_format,
+        .samples = .{ .@"1_bit" = true },
+        .load_op = .clear,
+        .store_op = .store,
+        .stencil_load_op = .clear,
+        .stencil_store_op = .dont_care,
+        .initial_layout = .@"undefined",
+        // after the renderpass ends, the image has to be on a layout ready for display
+        .final_layout = .depth_stencil_attachment_optimal,
+    };
+
+    const depth_attachment_ref = vk.AttachmentReference{
+        .attachment = 1,
+        .layout = .depth_stencil_attachment_optimal,
+    };
+
     // we are going to create 1 subpass, which is the minimum you can do
     const subpass = vk.SubpassDescription{
         .flags = .{},
@@ -390,23 +536,49 @@ fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain) !vk.Render
         .color_attachment_count = 1,
         .p_color_attachments = @ptrCast([*]const vk.AttachmentReference, &color_attachment_ref),
         .p_resolve_attachments = null,
-        .p_depth_stencil_attachment = null,
+        .p_depth_stencil_attachment = &depth_attachment_ref,
         .preserve_attachment_count = 0,
         .p_preserve_attachments = undefined,
     };
 
+    const dependency = vk.SubpassDependency{
+        .src_subpass = vk.SUBPASS_EXTERNAL,
+        .dst_subpass = 0,
+        .src_stage_mask = .{ .color_attachment_output_bit = true },
+        .dst_stage_mask = .{ .color_attachment_output_bit = true },
+        .src_access_mask = .{},
+        .dst_access_mask = .{ .color_attachment_write_bit = true },
+        .dependency_flags = .{},
+    };
+
+    const depth_dependency = vk.SubpassDependency{
+        .src_subpass = vk.SUBPASS_EXTERNAL,
+        .dst_subpass = 0,
+        .src_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
+        .dst_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
+        .src_access_mask = .{},
+        .dst_access_mask = .{},
+        .dependency_flags = .{},
+    };
+
     return try gc.vkd.createRenderPass(gc.dev, &.{
         .flags = .{},
-        .attachment_count = 1,
-        .p_attachments = @ptrCast([*]const vk.AttachmentDescription, &color_attachment),
+        .attachment_count = 2,
+        .p_attachments = &[_]vk.AttachmentDescription{ color_attachment, depth_attachment },
         .subpass_count = 1,
         .p_subpasses = @ptrCast([*]const vk.SubpassDescription, &subpass),
-        .dependency_count = 0,
-        .p_dependencies = undefined,
+        .dependency_count = 2,
+        .p_dependencies = &[_]vk.SubpassDependency{ dependency, depth_dependency },
     }, null);
 }
 
-fn createFramebuffers(gc: *const GraphicsContext, allocator: Allocator, render_pass: vk.RenderPass, swapchain: Swapchain) ![]vk.Framebuffer {
+fn createFramebuffers(
+    gc: *const GraphicsContext,
+    allocator: Allocator,
+    render_pass: vk.RenderPass,
+    swapchain: Swapchain,
+    depth_image_view: vk.ImageView,
+) ![]vk.Framebuffer {
     const framebuffers = try allocator.alloc(vk.Framebuffer, swapchain.swap_images.len);
     errdefer allocator.free(framebuffers);
 
@@ -417,8 +589,8 @@ fn createFramebuffers(gc: *const GraphicsContext, allocator: Allocator, render_p
         fb.* = try gc.vkd.createFramebuffer(gc.dev, &.{
             .flags = .{},
             .render_pass = render_pass,
-            .attachment_count = 1,
-            .p_attachments = @ptrCast([*]const vk.ImageView, &swapchain.swap_images[i].view),
+            .attachment_count = 2,
+            .p_attachments = &[_]vk.ImageView{ swapchain.swap_images[i].view, depth_image_view },
             .width = swapchain.extent.width,
             .height = swapchain.extent.height,
             .layers = 1,
@@ -565,6 +737,19 @@ fn createPipeline(
         .p_scissors = @ptrCast([*]const vk.Rect2D, &scissor),
     };
 
+    const depth_stencil_info = vk.PipelineDepthStencilStateCreateInfo{
+        .flags = .{},
+        .depth_test_enable = vk.TRUE,
+        .depth_write_enable = vk.TRUE,
+        .depth_compare_op = .less_or_equal,
+        .depth_bounds_test_enable = vk.FALSE,
+        .stencil_test_enable = vk.FALSE,
+        .front = std.mem.zeroInit(vk.StencilOpState, .{}),
+        .back = std.mem.zeroInit(vk.StencilOpState, .{}),
+        .min_depth_bounds = 0.0,
+        .max_depth_bounds = 1.0,
+    };
+
     const pipeline_info = vk.GraphicsPipelineCreateInfo{
         .flags = .{},
         .stage_count = stage_infos.len,
@@ -575,7 +760,7 @@ fn createPipeline(
         .p_viewport_state = &viewport_info,
         .p_rasterization_state = &rasterization_info,
         .p_multisample_state = &msaa_info,
-        .p_depth_stencil_state = null,
+        .p_depth_stencil_state = &depth_stencil_info,
         .p_color_blend_state = &color_blend_info,
         .p_dynamic_state = null,
         .layout = layout,
@@ -595,34 +780,6 @@ fn createPipeline(
         @ptrCast([*]vk.Pipeline, &pipeline),
     );
     return pipeline;
-}
-
-fn uploadMesh(gc: *const GraphicsContext, vma: *zva.Allocator, mesh: Mesh) !AllocatedBuffer {
-    const buffer_info = vk.BufferCreateInfo{
-        .flags = .{},
-        .size = mesh.vertices.items.len * @sizeOf(Vertex),
-        .usage = .{ .vertex_buffer_bit = true },
-        .sharing_mode = .exclusive,
-        .queue_family_index_count = 0,
-        .p_queue_family_indices = undefined,
-    };
-
-    const buffer = try gc.vkd.createBuffer(gc.dev, &buffer_info, null);
-    errdefer gc.vkd.destroyBuffer(gc.dev, buffer, null);
-
-    const mem_req = gc.vkd.getBufferMemoryRequirements(gc.dev, buffer);
-    var allocation = try vma.alloc(
-        mem_req.size,
-        mem_req.alignment,
-        mem_req.memory_type_bits,
-        .CpuToGpu,
-        .Buffer,
-    );
-    errdefer vma.free(allocation);
-    try gc.vkd.bindBufferMemory(gc.dev, buffer, allocation.memory, allocation.offset);
-    std.mem.copy(u8, allocation.data, std.mem.sliceAsBytes(mesh.vertices.items));
-
-    return AllocatedBuffer{ .buffer = buffer, .allocation = allocation };
 }
 
 test "load obj mesh" {
