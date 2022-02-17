@@ -31,6 +31,63 @@ var g_selectedShader: enum { red, colored, mesh } = .mesh;
 
 const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
 
+const Frame = struct {
+    // synchronisation structures
+    present_semaphore: vk.Semaphore,
+    render_semaphore: vk.Semaphore,
+
+    // command pool and buffer
+    cmd_pool: vk.CommandPool,
+    cmd_buf: vk.CommandBuffer,
+
+    // number of frames to overlap when rendering
+    const FRAME_OVERLAP = 2;
+
+    var queue = [_]Frame{undefined} ** FRAME_OVERLAP;
+
+    pub fn createSyncStructures(self: *Frame, gc: *const GraphicsContext) !void {
+        self.present_semaphore = try gc.vkd.createSemaphore(gc.dev, &.{ .flags = .{} }, null);
+        errdefer gc.vkd.destroySemaphore(gc.dev, self.present_semaphore, null);
+
+        self.render_semaphore = try gc.vkd.createSemaphore(gc.dev, &.{ .flags = .{} }, null);
+    }
+
+    pub fn freeSyncStructures(self: *Frame, gc: *const GraphicsContext) void {
+        gc.vkd.destroySemaphore(gc.dev, self.render_semaphore, null);
+        gc.vkd.destroySemaphore(gc.dev, self.present_semaphore, null);
+    }
+
+    pub fn createCommandBuffer(self: *Frame, gc: *const GraphicsContext) !void {
+        // create a command pool for commands submitted to the graphics queue
+        self.cmd_pool = try gc.vkd.createCommandPool(gc.dev, &.{
+            .flags = .{ .reset_command_buffer_bit = true },
+            .queue_family_index = gc.graphics_queue.family,
+        }, null);
+        errdefer gc.vkd.destroyCommandPool(gc.dev, self.cmd_pool, null);
+
+        // allocate the default command buffer that we will use for rendering
+        try gc.vkd.allocateCommandBuffers(gc.dev, &.{
+            .command_pool = self.cmd_pool,
+            .level = .primary,
+            .command_buffer_count = 1,
+        }, @ptrCast([*]vk.CommandBuffer, &self.cmd_buf));
+    }
+
+    pub fn freeCommandBuffer(self: *Frame, gc: *const GraphicsContext) void {
+        gc.vkd.freeCommandBuffers(
+            gc.dev,
+            self.cmd_pool,
+            1,
+            @ptrCast([*]vk.CommandBuffer, &self.cmd_buf),
+        );
+        gc.vkd.destroyCommandPool(gc.dev, self.cmd_pool, null);
+    }
+
+    pub fn get_current_frame(frame_number: u32) *Frame {
+        return &queue[frame_number % FRAME_OVERLAP];
+    }
+};
+
 const Buffer = struct {
     buffer: vk.Buffer,
     allocation: zva.Allocation,
@@ -240,24 +297,17 @@ pub fn main() !void {
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
 
-    // create a command pool for commands submitted to the graphics queue
-    const pool = try gc.vkd.createCommandPool(gc.dev, &.{
-        .flags = .{ .reset_command_buffer_bit = true },
-        .queue_family_index = gc.graphics_queue.family,
-    }, null);
-    defer gc.vkd.destroyCommandPool(gc.dev, pool, null);
+    // create command pool and buffer for each frame
+    {
+        var i: u8 = 0;
+        errdefer for (Frame.queue[0..i]) |*frame| frame.freeCommandBuffer(&gc);
 
-    // command buffer
-    const cmdbufs = try allocator.alloc(vk.CommandBuffer, 1);
-    defer allocator.free(cmdbufs);
-
-    // allocate the default command buffer that we will use for rendering
-    try gc.vkd.allocateCommandBuffers(gc.dev, &.{
-        .command_pool = pool,
-        .level = .primary,
-        .command_buffer_count = @intCast(u32, cmdbufs.len),
-    }, cmdbufs.ptr);
-    defer gc.vkd.freeCommandBuffers(gc.dev, pool, @truncate(u32, cmdbufs.len), cmdbufs.ptr);
+        for (Frame.queue) |*frame| {
+            try frame.createCommandBuffer(&gc);
+            i += 1;
+        }
+    }
+    defer for (Frame.queue) |*frame| frame.freeCommandBuffer(&gc);
 
     // define the mesh for the mesh shader pipeline
     var mesh = Mesh.init(allocator);
@@ -357,10 +407,17 @@ pub fn main() !void {
     var fence = try gc.vkd.createFence(gc.dev, &.{ .flags = .{ .signaled_bit = true } }, null);
     defer gc.vkd.destroyFence(gc.dev, fence, null);
 
-    var present_semaphore = try gc.vkd.createSemaphore(gc.dev, &.{ .flags = .{} }, null);
-    defer gc.vkd.destroySemaphore(gc.dev, present_semaphore, null);
-    var render_semaphore = try gc.vkd.createSemaphore(gc.dev, &.{ .flags = .{} }, null);
-    defer gc.vkd.destroySemaphore(gc.dev, render_semaphore, null);
+    // create semaphores to synchronise rendering for each frame
+    {
+        var i: u8 = 0;
+        errdefer for (Frame.queue[0..i]) |*frame| frame.freeSyncStructures(&gc);
+
+        for (Frame.queue) |*frame| {
+            try frame.createSyncStructures(&gc);
+            i += 1;
+        }
+    }
+    defer for (Frame.queue) |*frame| frame.freeSyncStructures(&gc);
 
     // wait until device is idle to start cleanup
     defer gc.vkd.deviceWaitIdle(gc.dev) catch {};
@@ -368,21 +425,21 @@ pub fn main() !void {
     var frame_number: u32 = 0;
     // Wait for the user to close the window.
     while (!window.shouldClose()) : (frame_number += 1) {
-        const cmdbuf = cmdbufs[0];
+        const curr_frame = Frame.get_current_frame(frame_number);
 
         // wait until the GPU has finished rendering the last frame. Timeout of 1 second
         _ = try gc.vkd.waitForFences(gc.dev, 1, @ptrCast([*]vk.Fence, &fence), @boolToInt(true), 1_000_000_000);
         try gc.vkd.resetFences(gc.dev, 1, @ptrCast([*]vk.Fence, &fence));
 
         // now that we are sure that the commands finished executing, we can safely reset the command buffer to begin recording again
-        try gc.vkd.resetCommandBuffer(cmdbuf, .{});
+        try gc.vkd.resetCommandBuffer(curr_frame.cmd_buf, .{});
 
         // request image from the swapchain, one second timeout
-        const result = try gc.vkd.acquireNextImageKHR(gc.dev, swapchain.handle, 1_000_000_000, present_semaphore, .null_handle);
+        const result = try gc.vkd.acquireNextImageKHR(gc.dev, swapchain.handle, 1_000_000_000, curr_frame.present_semaphore, .null_handle);
         const image_index = result.image_index;
 
         // begin the command buffer recording. We will use this command buffer exactly once, so we want to let Vulkan know that
-        try gc.vkd.beginCommandBuffer(cmdbuf, &.{
+        try gc.vkd.beginCommandBuffer(curr_frame.cmd_buf, &.{
             .flags = .{ .one_time_submit_bit = true },
             .p_inheritance_info = null,
         });
@@ -404,16 +461,16 @@ pub fn main() !void {
 
         // start the main renderpass
         // we will use the clear color from above, and the framebuffer of the index the swapchain gave us
-        gc.vkd.cmdBeginRenderPass(cmdbuf, &rp_begin_info, .@"inline");
+        gc.vkd.cmdBeginRenderPass(curr_frame.cmd_buf, &rp_begin_info, .@"inline");
 
-        gc.vkd.cmdBindPipeline(cmdbuf, .graphics, switch (g_selectedShader) {
+        gc.vkd.cmdBindPipeline(curr_frame.cmd_buf, .graphics, switch (g_selectedShader) {
             .red => red_pipeline,
             .colored => colored_pipeline,
             .mesh => mesh_pipeline,
         });
 
         if (g_selectedShader == .mesh) {
-            gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast([*]const vk.Buffer, &buffer.buffer), &[_]vk.DeviceSize{0});
+            gc.vkd.cmdBindVertexBuffers(curr_frame.cmd_buf, 0, 1, @ptrCast([*]const vk.Buffer, &buffer.buffer), &[_]vk.DeviceSize{0});
 
             // make a model view matrix for rendering the object
             const cam_pos = vec3(0, -0.2, 2);
@@ -439,7 +496,7 @@ pub fn main() !void {
                 .render_matrix = mesh_matrix,
             };
             gc.vkd.cmdPushConstants(
-                cmdbuf,
+                curr_frame.cmd_buf,
                 mesh_pipeline_layout,
                 .{ .vertex_bit = true },
                 0,
@@ -447,27 +504,27 @@ pub fn main() !void {
                 std.mem.asBytes(&constants),
             );
 
-            gc.vkd.cmdDraw(cmdbuf, @intCast(u32, mesh.vertices.items.len), 1, 0, 0);
+            gc.vkd.cmdDraw(curr_frame.cmd_buf, @intCast(u32, mesh.vertices.items.len), 1, 0, 0);
         } else {
-            gc.vkd.cmdDraw(cmdbuf, 3, 1, 0, 0);
+            gc.vkd.cmdDraw(curr_frame.cmd_buf, 3, 1, 0, 0);
         }
 
         // finalize the render pass
-        gc.vkd.cmdEndRenderPass(cmdbuf);
+        gc.vkd.cmdEndRenderPass(curr_frame.cmd_buf);
         // finalize the command buffer (we can no longer add commands, but it can now be executed)
-        try gc.vkd.endCommandBuffer(cmdbuf);
+        try gc.vkd.endCommandBuffer(curr_frame.cmd_buf);
 
         // prepare the submission to the queue.
         // we want to wait on the present_semaphore, as that semaphore is signaled when the swapchain is ready
         // we will signal the render_semaphore, to signal that rendering has finished
         const submit_info = vk.SubmitInfo{
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast([*]const vk.Semaphore, &present_semaphore),
+            .p_wait_semaphores = @ptrCast([*]const vk.Semaphore, &curr_frame.present_semaphore),
             .p_wait_dst_stage_mask = @ptrCast([*]const vk.PipelineStageFlags, &vk.PipelineStageFlags{ .color_attachment_output_bit = true }),
             .command_buffer_count = 1,
-            .p_command_buffers = cmdbufs.ptr,
+            .p_command_buffers = @ptrCast([*]vk.CommandBuffer, &curr_frame.cmd_buf),
             .signal_semaphore_count = 1,
-            .p_signal_semaphores = @ptrCast([*]const vk.Semaphore, &render_semaphore),
+            .p_signal_semaphores = @ptrCast([*]const vk.Semaphore, &curr_frame.render_semaphore),
         };
         try gc.vkd.queueSubmit(gc.graphics_queue.handle, 1, @ptrCast([*]const vk.SubmitInfo, &submit_info), fence);
 
@@ -476,7 +533,7 @@ pub fn main() !void {
         // as it's necessary that drawing commands have finished before the image is displayed to the user
         _ = try gc.vkd.queuePresentKHR(gc.graphics_queue.handle, &.{
             .wait_semaphore_count = 1,
-            .p_wait_semaphores = @ptrCast([*]const vk.Semaphore, &render_semaphore),
+            .p_wait_semaphores = @ptrCast([*]const vk.Semaphore, &curr_frame.render_semaphore),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast([*]const vk.SwapchainKHR, &swapchain.handle),
             .p_image_indices = @ptrCast([*]const u32, &image_index),
