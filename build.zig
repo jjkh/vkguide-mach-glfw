@@ -42,7 +42,7 @@ pub fn build(b: *std.build.Builder) void {
     res.addShader("red_triangle_frag", "assets/shaders/red_triangle.frag");
     res.addShader("colored_triangle_vert", "assets/shaders/colored_triangle.vert");
     res.addShader("colored_triangle_frag", "assets/shaders/colored_triangle.frag");
-    res.addShader("mesh_triangle_vert", "assets/shaders/mesh_triangle.vert");
+    res.addShader("mesh_vert", "assets/shaders/mesh.vert");
     exe.addPackage(res.package);
 
     // freetype

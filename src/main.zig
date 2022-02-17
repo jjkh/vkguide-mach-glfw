@@ -259,7 +259,7 @@ pub fn main() !void {
     }, cmdbufs.ptr);
     defer gc.vkd.freeCommandBuffers(gc.dev, pool, @truncate(u32, cmdbufs.len), cmdbufs.ptr);
 
-    // define the triangle mesh for the mesh shader pipeline
+    // define the mesh for the mesh shader pipeline
     var mesh = Mesh.init(allocator);
     defer mesh.deinit();
 
@@ -325,7 +325,7 @@ pub fn main() !void {
     // mesh vertices, using colored triangle interpolation
     const mesh_pipeline = try createPipeline(
         &gc,
-        resources.mesh_triangle_vert,
+        resources.mesh_vert,
         resources.colored_triangle_frag,
         mesh_pipeline_layout,
         render_pass,
