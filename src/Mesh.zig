@@ -135,22 +135,22 @@ pub fn loadObj(self: *Mesh, filename: []const u8) !void {
     log.debug("{} face number vertices", .{attrib.num_face_num_verts});
 
     // loop over shapes
-    for (shapes[0..shapes_count]) |shape| {
-        const name = if (shape.name != null) std.mem.sliceTo(shape.name, 0) else "<no name>";
-        log.debug("reading shape '{s}', len {}\n", .{ name, shape.length });
+    for (shapes[0..shapes_count]) |shape, i| {
+        if (shape.name != null) {
+            const name = std.mem.trim(u8, std.mem.sliceTo(shape.name, 0), "\r\n");
+            log.debug("reading shape '{s}', len {}\n", .{ name, shape.length });
+        } else log.debug("reading shape {}, len {}\n", .{ i, shape.length });
 
         // hardcode 3 vertices per face
         const VERT_COUNT = 3;
 
         // loop over faces (polygons)
-        // var index_offset: usize = 0;
-        // var f: usize = 0;
         for (attrib.faces[shape.face_offset .. shape.face_offset + shape.length * VERT_COUNT]) |face| {
             const has_normal = face.vn_idx >= 0;
             const normal = if (has_normal) vec3(
-                attrib.vertices[3 * @intCast(usize, face.vn_idx) + 0],
-                attrib.vertices[3 * @intCast(usize, face.vn_idx) + 1],
-                attrib.vertices[3 * @intCast(usize, face.vn_idx) + 2],
+                attrib.normals[3 * @intCast(usize, face.vn_idx) + 0],
+                attrib.normals[3 * @intCast(usize, face.vn_idx) + 1],
+                attrib.normals[3 * @intCast(usize, face.vn_idx) + 2],
             ) else vec3(0, 0, 0);
 
             try self.vertices.append(.{
