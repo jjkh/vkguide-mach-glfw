@@ -31,6 +31,12 @@ var g_selectedShader: enum { red, colored, mesh } = .mesh;
 
 const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
 
+const GpuCameraData = struct {
+    view: Mat4,
+    proj: Mat4,
+    view_proj: Mat4,
+};
+
 const Frame = struct {
     // synchronisation structures
     present_semaphore: vk.Semaphore,
@@ -39,6 +45,10 @@ const Frame = struct {
     // command pool and buffer
     cmd_pool: vk.CommandPool,
     cmd_buf: vk.CommandBuffer,
+
+    // camera data and per-frame descriptor set
+    camera_buf: Buffer,
+    global_desc: vk.DescriptorSet,
 
     // number of frames to overlap when rendering
     const FRAME_OVERLAP = 2;
@@ -92,16 +102,21 @@ const Buffer = struct {
     buffer: vk.Buffer,
     allocation: zva.Allocation,
 
-    pub fn uploadMesh(gc: *const GraphicsContext, vma: *zva.Allocator, mesh: Mesh) !Buffer {
+    pub fn create(
+        gc: *const GraphicsContext,
+        vma: *zva.Allocator,
+        alloc_size: usize,
+        usage: vk.BufferUsageFlags,
+        memory_usage: zva.MemoryUsage,
+    ) !Buffer {
         const buffer_info = vk.BufferCreateInfo{
             .flags = .{},
-            .size = mesh.vertices.items.len * @sizeOf(Vertex),
-            .usage = .{ .vertex_buffer_bit = true },
+            .size = alloc_size,
+            .usage = usage,
             .sharing_mode = .exclusive,
             .queue_family_index_count = 0,
             .p_queue_family_indices = undefined,
         };
-
         const buffer = try gc.vkd.createBuffer(gc.dev, &buffer_info, null);
         errdefer gc.vkd.destroyBuffer(gc.dev, buffer, null);
 
@@ -110,15 +125,28 @@ const Buffer = struct {
             mem_req.size,
             mem_req.alignment,
             mem_req.memory_type_bits,
-            .CpuToGpu,
+            memory_usage,
             .Buffer,
             .{},
         );
-        errdefer vma.free(allocation);
-        try gc.vkd.bindBufferMemory(gc.dev, buffer, allocation.memory, allocation.offset);
-        std.mem.copy(u8, allocation.data, std.mem.sliceAsBytes(mesh.vertices.items));
 
         return Buffer{ .buffer = buffer, .allocation = allocation };
+    }
+
+    pub fn uploadMesh(gc: *const GraphicsContext, vma: *zva.Allocator, mesh: Mesh) !Buffer {
+        var buf = try Buffer.create(
+            gc,
+            vma,
+            mesh.vertices.items.len * @sizeOf(Vertex),
+            .{ .vertex_buffer_bit = true },
+            .CpuToGpu,
+        );
+        errdefer buf.free(gc, vma);
+
+        try gc.vkd.bindBufferMemory(gc.dev, buf.buffer, buf.allocation.memory, buf.allocation.offset);
+        std.mem.copy(u8, buf.allocation.data, std.mem.sliceAsBytes(mesh.vertices.items));
+
+        return buf;
     }
 
     pub fn free(self: *Buffer, gc: *const GraphicsContext, vma: *zva.Allocator) void {
@@ -309,6 +337,111 @@ pub fn main() !void {
     }
     defer for (Frame.queue) |*frame| frame.freeCommandBuffer(&gc);
 
+    var fence = try gc.vkd.createFence(gc.dev, &.{ .flags = .{ .signaled_bit = true } }, null);
+    defer gc.vkd.destroyFence(gc.dev, fence, null);
+
+    // create semaphores to synchronise rendering for each frame
+    {
+        var i: u8 = 0;
+        errdefer for (Frame.queue[0..i]) |*frame| frame.freeSyncStructures(&gc);
+
+        for (Frame.queue) |*frame| {
+            try frame.createSyncStructures(&gc);
+            i += 1;
+        }
+    }
+    defer for (Frame.queue) |*frame| frame.freeSyncStructures(&gc);
+
+    // create a descriptor pool that willhold up to 10 uniform buffers
+    var pool_sizes = try std.ArrayList(vk.DescriptorPoolSize).initCapacity(allocator, 1);
+    defer pool_sizes.deinit();
+    pool_sizes.appendAssumeCapacity(.{ .@"type" = .uniform_buffer, .descriptor_count = 10 });
+
+    const descriptor_pool = try gc.vkd.createDescriptorPool(gc.dev, &.{
+        .flags = .{},
+        .max_sets = 10,
+        .pool_size_count = @intCast(u32, pool_sizes.items.len),
+        .p_pool_sizes = pool_sizes.items.ptr,
+    }, null);
+    defer gc.vkd.destroyDescriptorPool(gc.dev, descriptor_pool, null);
+
+    // create camera descriptor set
+    var cam_buffer_binding = vk.DescriptorSetLayoutBinding{
+        .binding = 0,
+        .descriptor_type = .uniform_buffer,
+        .descriptor_count = 1,
+        // we use it from the vertex shader
+        .stage_flags = .{ .vertex_bit = true },
+        .p_immutable_samplers = null,
+    };
+
+    const global_set_layout = try gc.vkd.createDescriptorSetLayout(gc.dev, &.{
+        .flags = .{},
+        .binding_count = 1,
+        .p_bindings = @ptrCast([*]vk.DescriptorSetLayoutBinding, &cam_buffer_binding),
+    }, null);
+    defer gc.vkd.destroyDescriptorSetLayout(gc.dev, global_set_layout, null);
+
+    // create camera for each frame
+    {
+        var i: u8 = 0;
+        errdefer for (Frame.queue[0..i]) |*frame| frame.camera_buf.free(&gc, &vma);
+
+        for (Frame.queue) |*frame| {
+            frame.camera_buf = try Buffer.create(
+                &gc,
+                &vma,
+                @sizeOf(GpuCameraData),
+                .{ .uniform_buffer_bit = true },
+                .CpuToGpu,
+            );
+            errdefer frame.camera_buf.free(&gc, &vma);
+
+            // allocate one descriptor set for each frame
+            try gc.vkd.allocateDescriptorSets(gc.dev, &.{
+                .descriptor_pool = descriptor_pool,
+                .descriptor_set_count = 1,
+                .p_set_layouts = @ptrCast([*]const vk.DescriptorSetLayout, &global_set_layout),
+            }, @ptrCast([*]vk.DescriptorSet, &frame.global_desc));
+
+            try gc.vkd.bindBufferMemory(
+                gc.dev,
+                frame.camera_buf.buffer,
+                frame.camera_buf.allocation.memory,
+                frame.camera_buf.allocation.offset,
+            );
+
+            // point the descriptor to the camera buffer
+            const set_write = vk.WriteDescriptorSet{
+                .dst_set = frame.global_desc,
+                .dst_binding = 0,
+                .dst_array_element = 0,
+
+                .descriptor_count = 1,
+                .descriptor_type = .uniform_buffer,
+
+                .p_image_info = undefined,
+                .p_buffer_info = &.{
+                    .buffer = frame.camera_buf.buffer,
+                    .offset = 0,
+                    .range = @sizeOf(GpuCameraData),
+                },
+                .p_texel_buffer_view = undefined,
+            };
+
+            gc.vkd.updateDescriptorSets(
+                gc.dev,
+                1,
+                @ptrCast([*]const vk.WriteDescriptorSet, &set_write),
+                0,
+                undefined,
+            );
+
+            i += 1;
+        }
+    }
+    defer for (Frame.queue) |*frame| frame.camera_buf.free(&gc, &vma);
+
     // define the mesh for the mesh shader pipeline
     var mesh = Mesh.init(allocator);
     defer mesh.deinit();
@@ -365,8 +498,8 @@ pub fn main() !void {
 
     const mesh_pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
         .flags = .{},
-        .set_layout_count = 0,
-        .p_set_layouts = undefined,
+        .set_layout_count = 1,
+        .p_set_layouts = @ptrCast([*]const vk.DescriptorSetLayout, &global_set_layout),
         .push_constant_range_count = 1,
         .p_push_constant_ranges = @ptrCast([*]const vk.PushConstantRange, &push_constant),
     }, null);
@@ -403,21 +536,6 @@ pub fn main() !void {
         for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
         allocator.free(framebuffers);
     }
-
-    var fence = try gc.vkd.createFence(gc.dev, &.{ .flags = .{ .signaled_bit = true } }, null);
-    defer gc.vkd.destroyFence(gc.dev, fence, null);
-
-    // create semaphores to synchronise rendering for each frame
-    {
-        var i: u8 = 0;
-        errdefer for (Frame.queue[0..i]) |*frame| frame.freeSyncStructures(&gc);
-
-        for (Frame.queue) |*frame| {
-            try frame.createSyncStructures(&gc);
-            i += 1;
-        }
-    }
-    defer for (Frame.queue) |*frame| frame.freeSyncStructures(&gc);
 
     // wait until device is idle to start cleanup
     defer gc.vkd.deviceWaitIdle(gc.dev) catch {};
@@ -473,12 +591,6 @@ pub fn main() !void {
             gc.vkd.cmdBindVertexBuffers(curr_frame.cmd_buf, 0, 1, @ptrCast([*]const vk.Buffer, &buffer.buffer), &[_]vk.DeviceSize{0});
 
             // make a model view matrix for rendering the object
-            const cam_pos = vec3(0, -0.2, 2);
-            const rot_mat = Mat4.createAngleAxis(vec3(0, 1, 0), zlm.toRadians(@intToFloat(f32, frame_number) * 0.01));
-            // const rot_mat_2 = Mat4.createAngleAxis(vec3(1, 0, 0), 2);
-            // const rot_mat_2 = Mat4.createLookAt(cam_pos, vec3(0, 0, 0), vec3(0, 1, 0));
-
-            const view = Mat4.createTranslation(cam_pos);
             var projection = Mat4.createPerspective(
                 zlm.toRadians(60.0),
                 800.0 / 600.0,
@@ -487,13 +599,35 @@ pub fn main() !void {
             );
             projection.fields[1][1] *= -1;
 
-            // calculate final mesh matrix
-            const mesh_matrix = rot_mat.mul(view.mul(projection));
-            // std.log.debug("{}", .{mesh_matrix});
+            const UP = vec3(0, 1, 0);
+            const CENTRE = Vec3.zero;
+
+            const cam_pos = vec3(0, 0.6, 3);
+            const view = Mat4.createLookAt(cam_pos, CENTRE, UP);
+
+            const rot_mat = Mat4.createAngleAxis(UP, zlm.toRadians(@intToFloat(f32, frame_number) * 0.01));
+
+            const cam_data = GpuCameraData{
+                .proj = projection,
+                .view = view,
+                .view_proj = rot_mat.mul(view.mul(projection)),
+            };
+
+            std.mem.copy(u8, curr_frame.camera_buf.allocation.data, std.mem.asBytes(&cam_data));
+            gc.vkd.cmdBindDescriptorSets(
+                curr_frame.cmd_buf,
+                .graphics,
+                mesh_pipeline_layout,
+                0,
+                1,
+                @ptrCast([*]const vk.DescriptorSet, &curr_frame.global_desc),
+                0,
+                undefined,
+            );
 
             const constants = PushConstants{
                 .data = Vec4.zero,
-                .render_matrix = mesh_matrix,
+                .render_matrix = Mat4.identity,
             };
             gc.vkd.cmdPushConstants(
                 curr_frame.cmd_buf,
