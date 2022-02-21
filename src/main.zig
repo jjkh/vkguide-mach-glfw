@@ -1,6 +1,8 @@
 const std = @import("std");
+const log = std.log;
 const Allocator = std.mem.Allocator;
 
+// TODO: sort out these imports
 const glfw = @import("glfw");
 const resources = @import("resources");
 const vk = @import("vulkan");
@@ -19,6 +21,10 @@ const Frames = @import("engine/frames.zig").Frames;
 const Frame = @import("engine/frames.zig").Frame;
 const GpuCameraData = @import("engine/frames.zig").GpuCameraData;
 
+const createPipeline = @import("engine/pipeline.zig").createPipeline;
+const createRenderPass = @import("engine/renderpass.zig").createRenderPass;
+const createFramebuffers = @import("engine/renderpass.zig").createFramebuffers;
+
 const vec3 = zlm.vec3;
 const Vec3 = zlm.Vec3;
 const Vec4 = zlm.Vec4;
@@ -29,57 +35,25 @@ pub const PushConstants = struct {
     render_matrix: Mat4,
 };
 
-pub const c = @cImport({
-    @cInclude("ft2build.h");
-    @cInclude("freetype/freetype.h");
-});
-
 var g_selectedShader: enum { red, colored, mesh } = .mesh;
 
 const font_file = @embedFile("../deps/techna-sans/TechnaSans-Regular.otf");
 
+// TODO: split into init/draw functions, with minimal defined shared state
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     try glfw.init(.{});
     errdefer glfw.terminate();
 
-    // var ft_handle: c.FT_Library = undefined;
-    // {
-    //     const status = c.FT_Init_FreeType(&ft_handle);
-    //     if (status > 0) {
-    //         std.debug.print("freetype init failed with code {}\n", .{status});
-    //         return error.FreeTypeInitFailed;
-    //     }
-    // }
-    // defer _ = c.FT_Done_FreeType(ft_handle);
-
-    // var ft_face: c.FT_Face = undefined;
-    // {
-    //     const status = c.FT_New_Memory_Face(ft_handle, font_file, font_file.len, 0, &ft_face);
-    //     if (status > 0) {
-    //         std.debug.print("font load failed with code {}\n", .{status});
-    //         return error.FreeTypeInitFailed;
-    //     }
-    // }
-    // defer _ = c.FT_Done_Face(ft_face);
-
-    // _ = c.FT_Set_Pixel_Sizes(ft_face, 0, 48);
-
-    // {
-    //     const status = c.FT_Load_Char(ft_face, 'x', c.FT_LOAD_RENDER);
-    //     if (status > 0) {
-    //         std.debug.print("glyph 'x' load failed with code {}\n", .{status});
-    //         return error.FreeTypeInitFailed;
-    //     }
-    // }
-    // defer _ = c.FT_Done_Face(ft_face);
-
+    // TODO: support resizing
+    // TODO: account for HiDPI
+    // window size
     var extent = vk.Extent2D{ .width = 800, .height = 600 };
 
-    // create the window
+    // create the glfw window
     const window = try glfw.Window.create(
         extent.width,
         extent.height,
@@ -90,11 +64,13 @@ pub fn main() !void {
     );
     defer window.destroy();
 
+    // add simple key commands
     window.setKeyCallback((struct {
         fn callback(_window: glfw.Window, key: glfw.Key, scancode: i32, action: glfw.Action, mods: glfw.Mods) void {
             _ = scancode;
             _ = mods;
 
+            // only handle keydown events
             if (action != .press and action != .repeat) return;
 
             switch (key) {
@@ -109,11 +85,15 @@ pub fn main() !void {
         }
     }).callback);
 
+    // initialise vulkan using the GLFW window with vulkan-zig
     const gc = try GraphicsContext.init(allocator, "vkguide example", window);
     defer gc.deinit();
 
-    std.debug.print("Using device: {s}\n", .{gc.deviceName()});
+    log.info("Using device: {s}", .{gc.deviceName()});
 
+    // initialise a vulkan allocator
+    // this is a light wrapper over the vulkan GPU memory functions
+    // TODO: refactor to be more ergonomic with more recent vulkan-zig
     var vma = try zva.Allocator.init(allocator, .{
         .getPhysicalDeviceProperties = gc.vki.dispatch.vkGetPhysicalDeviceProperties,
         .getPhysicalDeviceMemoryProperties = gc.vki.dispatch.vkGetPhysicalDeviceMemoryProperties,
@@ -125,26 +105,34 @@ pub fn main() !void {
     }, gc.pdev, gc.dev, 128);
     defer vma.deinit();
 
+    // a swapchain is a list of images accessible to the OS to draw to the screen
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
 
-    var fence = try gc.vkd.createFence(gc.dev, &.{ .flags = .{ .signaled_bit = true } }, null);
-    defer gc.vkd.destroyFence(gc.dev, fence, null);
-
+    // create a static buffer of all frame-specific data
+    // this allows double buffering by preparing the next frame while the previous frame is being drawn
     var frames = try Frames(2).create(&gc, &vma);
     defer frames.free();
 
     // define the mesh for the mesh shader pipeline
     var mesh = Mesh.init(allocator);
     defer mesh.deinit();
-
-    // try mesh.loadTriangle();
     try mesh.loadObj("assets/models/suzanne.obj");
-    // try mesh.loadObj("assets/models/box.obj");
+
+    // copy the mesh data to a shared CPU->GPU buffer
     var buffer = try Buffer.uploadMesh(&gc, &vma, mesh);
     defer buffer.free(&gc, &vma);
 
-    // define the pipelines and render pass
+    // all rendering commands must occur within a render pass
+    // a render pass encapsulates the state required to setup the target for rendering,
+    // and the state of the images being rendered
+    const render_pass = try createRenderPass(&gc, swapchain, .d32_sfloat);
+    defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
+
+    // a pipeline turns data/programs into pixels
+    // a pipeline has several sequential stages, defined by shaders
+    // the pipeline layout defines the stucture of the stages of the pipeline,
+    // and can be reused between pipelines
     const pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
         .flags = .{},
         .set_layout_count = 0,
@@ -153,9 +141,6 @@ pub fn main() !void {
         .p_push_constant_ranges = undefined,
     }, null);
     defer gc.vkd.destroyPipelineLayout(gc.dev, pipeline_layout, null);
-
-    const render_pass = try createRenderPass(&gc, swapchain, .d32_sfloat);
-    defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
 
     // solid red triangle
     const red_pipeline = try createPipeline(
@@ -181,13 +166,15 @@ pub fn main() !void {
     );
     defer gc.vkd.destroyPipeline(gc.dev, colored_pipeline, null);
 
-    // mesh gets its own pipeline layout to allow for push constants
+    // push constants provide a simple method for passing small amounts of data
+    // directly to a shader (both vertex and fragment)
     const push_constant = vk.PushConstantRange{
         .stage_flags = .{ .vertex_bit = true },
         .offset = 0,
         .size = @sizeOf(PushConstants),
     };
 
+    // mesh gets its own pipeline layout to allow for push constants
     const mesh_pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
         .flags = .{},
         .set_layout_count = 1,
@@ -209,6 +196,10 @@ pub fn main() !void {
     );
     defer gc.vkd.destroyPipeline(gc.dev, mesh_pipeline, null);
 
+    // a depth image is required by the render pipeline to ensure the correct
+    // vertices (pixels?) are drawn on the top
+    // this is part of the depth buffer, and is used by the render pass as a
+    // depth attachment
     var depth_image = try Image.create(
         &gc,
         &vma,
@@ -223,18 +214,27 @@ pub fn main() !void {
     );
     defer depth_image.free(&gc, &vma);
 
+    // framebuffers are created from a render pass, and are the link between the attachements
+    // of a renderpass and the real images they should render to
     var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth_image.view);
     defer {
         for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
         allocator.free(framebuffers);
     }
 
+    // a fence is used to ensure the GPU has finished it's work before continuing
+    var fence = try gc.vkd.createFence(gc.dev, &.{ .flags = .{ .signaled_bit = true } }, null);
+    defer gc.vkd.destroyFence(gc.dev, fence, null);
+
     // wait until device is idle to start cleanup
     defer gc.vkd.deviceWaitIdle(gc.dev) catch {};
 
+    // wait for the user to close the window.
     var frame_number: u32 = 0;
-    // Wait for the user to close the window.
+    var need_resize = false;
     while (!window.shouldClose()) : (frame_number += 1) {
+        // get the current frame to ensure the correct data buffers are being written to
+        // this also gets the correct semaphores to ensure we're waiting on the correct operations
         const curr_frame = frames.currentFrame(frame_number);
 
         // wait until the GPU has finished rendering the last frame. Timeout of 1 second
@@ -244,18 +244,32 @@ pub fn main() !void {
         // now that we are sure that the commands finished executing, we can safely reset the command buffer to begin recording again
         try gc.vkd.resetCommandBuffer(curr_frame.cmd_buf, .{});
 
+        // TODO: fix this, doesn't work
+        // allows resizing smaller but not larger...
+        if (need_resize) {
+            const new_size = try window.getSize();
+            try swapchain.recreate(.{ .width = new_size.width, .height = new_size.height });
+
+            for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
+            allocator.free(framebuffers);
+            framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth_image.view);
+
+            need_resize = false;
+        }
+
         // request image from the swapchain, one second timeout
         const result = try gc.vkd.acquireNextImageKHR(gc.dev, swapchain.handle, 1_000_000_000, curr_frame.present_semaphore, .null_handle);
         const image_index = result.image_index;
 
-        // begin the command buffer recording. We will use this command buffer exactly once, so we want to let Vulkan know that
+        // begin the command buffer recording
+        // we will use this command buffer exactly once, so we want to let Vulkan know that
         try gc.vkd.beginCommandBuffer(curr_frame.cmd_buf, &.{
             .flags = .{ .one_time_submit_bit = true },
             .p_inheritance_info = null,
         });
 
-        // make a clear-color from frame number. This will flash with a 12,000*pi frame period
-        const flash = std.math.absFloat(std.math.sin(@intToFloat(f32, frame_number) / 12_000.0));
+        // make a clear-color from frame number
+        const flash = std.math.absFloat(std.math.sin(@intToFloat(f32, frame_number) / 120.0));
         const clear_value = vk.ClearValue{ .color = .{ .float_32 = .{ 0.0, 0.0, flash, 1.0 } } };
 
         // clear depth at 1
@@ -264,7 +278,7 @@ pub fn main() !void {
         const rp_begin_info = vk.RenderPassBeginInfo{
             .render_pass = render_pass,
             .framebuffer = framebuffers[image_index],
-            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = swapchain.extent },
             .clear_value_count = 2,
             .p_clear_values = &[_]vk.ClearValue{ clear_value, depth_clear },
         };
@@ -297,7 +311,7 @@ pub fn main() !void {
             const cam_pos = vec3(0, 0.6, 3);
             const view = Mat4.createLookAt(cam_pos, CENTRE, UP);
 
-            const rot_mat = Mat4.createAngleAxis(UP, zlm.toRadians(@intToFloat(f32, frame_number) * 0.01));
+            const rot_mat = Mat4.createAngleAxis(UP, zlm.toRadians(@intToFloat(f32, frame_number)));
 
             const cam_data = GpuCameraData{
                 .proj = projection,
@@ -357,316 +371,18 @@ pub fn main() !void {
         // this will put the image we just rendered into the visible window.
         // we want to wait on the render_semaphore for that,
         // as it's necessary that drawing commands have finished before the image is displayed to the user
-        _ = try gc.vkd.queuePresentKHR(gc.graphics_queue.handle, &.{
+        _ = gc.vkd.queuePresentKHR(gc.graphics_queue.handle, &.{
             .wait_semaphore_count = 1,
             .p_wait_semaphores = @ptrCast([*]const vk.Semaphore, &curr_frame.render_semaphore),
             .swapchain_count = 1,
             .p_swapchains = @ptrCast([*]const vk.SwapchainKHR, &swapchain.handle),
             .p_image_indices = @ptrCast([*]const u32, &image_index),
             .p_results = null,
-        });
+        }) catch |err| switch (err) {
+            error.OutOfDateKHR => need_resize = true,
+            else => return err,
+        };
 
         try glfw.pollEvents();
     }
-}
-
-fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain, depth_format: vk.Format) !vk.RenderPass {
-    // the renderpass will use this color attachment
-    const color_attachment = vk.AttachmentDescription{
-        .flags = .{},
-        .format = swapchain.surface_format.format,
-        // 1 sample, we won't be doing MSAA
-        .samples = .{ .@"1_bit" = true },
-        .load_op = .clear,
-        .store_op = .store,
-        .stencil_load_op = .dont_care,
-        .stencil_store_op = .dont_care,
-        .initial_layout = .@"undefined",
-        // after the renderpass ends, the image has to be on a layout ready for display
-        .final_layout = .present_src_khr,
-    };
-
-    const color_attachment_ref = vk.AttachmentReference{
-        // attachment number will index into the pAttachments array in the parent renderpass itself
-        .attachment = 0,
-        .layout = .color_attachment_optimal,
-    };
-
-    const depth_attachment = vk.AttachmentDescription{
-        .flags = .{},
-        .format = depth_format,
-        .samples = .{ .@"1_bit" = true },
-        .load_op = .clear,
-        .store_op = .store,
-        .stencil_load_op = .clear,
-        .stencil_store_op = .dont_care,
-        .initial_layout = .@"undefined",
-        // after the renderpass ends, the image has to be on a layout ready for display
-        .final_layout = .depth_stencil_attachment_optimal,
-    };
-
-    const depth_attachment_ref = vk.AttachmentReference{
-        .attachment = 1,
-        .layout = .depth_stencil_attachment_optimal,
-    };
-
-    // we are going to create 1 subpass, which is the minimum you can do
-    const subpass = vk.SubpassDescription{
-        .flags = .{},
-        .pipeline_bind_point = .graphics,
-        .input_attachment_count = 0,
-        .p_input_attachments = undefined,
-        .color_attachment_count = 1,
-        .p_color_attachments = @ptrCast([*]const vk.AttachmentReference, &color_attachment_ref),
-        .p_resolve_attachments = null,
-        .p_depth_stencil_attachment = &depth_attachment_ref,
-        .preserve_attachment_count = 0,
-        .p_preserve_attachments = undefined,
-    };
-
-    const dependency = vk.SubpassDependency{
-        .src_subpass = vk.SUBPASS_EXTERNAL,
-        .dst_subpass = 0,
-        .src_stage_mask = .{ .color_attachment_output_bit = true },
-        .dst_stage_mask = .{ .color_attachment_output_bit = true },
-        .src_access_mask = .{},
-        .dst_access_mask = .{ .color_attachment_write_bit = true },
-        .dependency_flags = .{},
-    };
-
-    const depth_dependency = vk.SubpassDependency{
-        .src_subpass = vk.SUBPASS_EXTERNAL,
-        .dst_subpass = 0,
-        .src_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
-        .dst_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
-        .src_access_mask = .{},
-        .dst_access_mask = .{},
-        .dependency_flags = .{},
-    };
-
-    return try gc.vkd.createRenderPass(gc.dev, &.{
-        .flags = .{},
-        .attachment_count = 2,
-        .p_attachments = &[_]vk.AttachmentDescription{ color_attachment, depth_attachment },
-        .subpass_count = 1,
-        .p_subpasses = @ptrCast([*]const vk.SubpassDescription, &subpass),
-        .dependency_count = 2,
-        .p_dependencies = &[_]vk.SubpassDependency{ dependency, depth_dependency },
-    }, null);
-}
-
-fn createFramebuffers(
-    gc: *const GraphicsContext,
-    allocator: Allocator,
-    render_pass: vk.RenderPass,
-    swapchain: Swapchain,
-    depth_image_view: vk.ImageView,
-) ![]vk.Framebuffer {
-    const framebuffers = try allocator.alloc(vk.Framebuffer, swapchain.swap_images.len);
-    errdefer allocator.free(framebuffers);
-
-    var i: usize = 0;
-    errdefer for (framebuffers[0..i]) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
-
-    for (framebuffers) |*fb| {
-        fb.* = try gc.vkd.createFramebuffer(gc.dev, &.{
-            .flags = .{},
-            .render_pass = render_pass,
-            .attachment_count = 2,
-            .p_attachments = &[_]vk.ImageView{ swapchain.swap_images[i].view, depth_image_view },
-            .width = swapchain.extent.width,
-            .height = swapchain.extent.height,
-            .layers = 1,
-        }, null);
-        i += 1;
-    }
-
-    return framebuffers;
-}
-
-fn loadShaderModule(gc: *const GraphicsContext, shader: []const u8) !vk.ShaderModule {
-    return gc.vkd.createShaderModule(gc.dev, &.{
-        .flags = .{},
-        .code_size = shader.len,
-        .p_code = @ptrCast([*]const u32, @alignCast(4, shader)),
-    }, null);
-}
-const CreatePipelineOptions = struct {
-    vert_input_desc: ?Mesh.VertexInputDescription = null,
-};
-
-fn createPipeline(
-    gc: *const GraphicsContext,
-    vert_shader: []const u8,
-    frag_shader: []const u8,
-    layout: vk.PipelineLayout,
-    render_pass: vk.RenderPass,
-    extent: vk.Extent2D,
-    opts: CreatePipelineOptions,
-) !vk.Pipeline {
-    const vert = try loadShaderModule(gc, vert_shader);
-    defer gc.vkd.destroyShaderModule(gc.dev, vert, null);
-
-    const frag = try loadShaderModule(gc, frag_shader);
-    defer gc.vkd.destroyShaderModule(gc.dev, frag, null);
-    // build the stage_create_info for both vertex and fragment stages.
-    // this lets the pipeline know the shader modules per stage
-    const stage_infos = [_]vk.PipelineShaderStageCreateInfo{
-        .{
-            .flags = .{},
-            .stage = .{ .vertex_bit = true },
-            .module = vert,
-            .p_name = "main",
-            .p_specialization_info = null,
-        },
-        .{
-            .flags = .{},
-            .stage = .{ .fragment_bit = true },
-            .module = frag,
-            .p_name = "main",
-            .p_specialization_info = null,
-        },
-    };
-
-    // vertex input controls how to read vertices from vertex buffers
-    const vertex_input_info = vk.PipelineVertexInputStateCreateInfo{
-        .flags = .{},
-        .vertex_binding_description_count = if (opts.vert_input_desc) |vid| @intCast(u32, vid.bindings.len) else 0,
-        .p_vertex_binding_descriptions = if (opts.vert_input_desc) |vid| vid.bindings.ptr else undefined,
-        .vertex_attribute_description_count = if (opts.vert_input_desc) |vid| @intCast(u32, vid.attributes.len) else 0,
-        .p_vertex_attribute_descriptions = if (opts.vert_input_desc) |vid| vid.attributes.ptr else undefined,
-    };
-
-    // input assembly is the configuration for drawing triangle lists, strips, or individual points.
-    // we are just going to draw triangle list
-    const input_assembly_info = vk.PipelineInputAssemblyStateCreateInfo{
-        .flags = .{},
-        .topology = .triangle_list,
-        .primitive_restart_enable = vk.FALSE,
-    };
-
-    // configure the rasterizer to draw filled triangles
-    const rasterization_info = vk.PipelineRasterizationStateCreateInfo{
-        .flags = .{},
-        .depth_clamp_enable = vk.FALSE,
-        .rasterizer_discard_enable = vk.FALSE,
-
-        .polygon_mode = .fill,
-        .cull_mode = .{},
-        .front_face = .clockwise,
-
-        .depth_bias_enable = vk.FALSE,
-        .depth_bias_constant_factor = 0.0,
-        .depth_bias_clamp = 0.0,
-        .depth_bias_slope_factor = 0.0,
-
-        .line_width = 1.0,
-    };
-
-    // we don't use MSAA so just run the default one
-    const msaa_info = vk.PipelineMultisampleStateCreateInfo{
-        .flags = .{},
-        .rasterization_samples = .{ .@"1_bit" = true },
-        .sample_shading_enable = vk.FALSE,
-        .min_sample_shading = 1.0,
-        .p_sample_mask = null,
-        .alpha_to_coverage_enable = vk.FALSE,
-        .alpha_to_one_enable = vk.FALSE,
-    };
-
-    // a single blend attachment with no blending that writes to RGBA
-    const color_blend_attachment = vk.PipelineColorBlendAttachmentState{
-        .blend_enable = vk.FALSE,
-        .src_color_blend_factor = .one,
-        .dst_color_blend_factor = .zero,
-        .color_blend_op = .add,
-        .src_alpha_blend_factor = .one,
-        .dst_alpha_blend_factor = .zero,
-        .alpha_blend_op = .add,
-
-        .color_write_mask = .{
-            .r_bit = true,
-            .g_bit = true,
-            .b_bit = true,
-            .a_bit = true,
-        },
-    };
-    const color_blend_info = vk.PipelineColorBlendStateCreateInfo{
-        .flags = .{},
-        .logic_op_enable = vk.FALSE,
-        .logic_op = .copy,
-        .attachment_count = 1,
-        .p_attachments = @ptrCast([*]const @TypeOf(color_blend_attachment), &color_blend_attachment),
-        .blend_constants = [_]f32{ 0.0, 0.0, 0.0, 0.0 },
-    };
-
-    const viewport = vk.Viewport{
-        .x = 0.0,
-        .y = 0.0,
-        .width = @intToFloat(f32, extent.width),
-        .height = @intToFloat(f32, extent.height),
-        .min_depth = 0.0,
-        .max_depth = 1.0,
-    };
-    const scissor = vk.Rect2D{
-        .offset = .{ .x = 0, .y = 0 },
-        .extent = extent,
-    };
-    const viewport_info = vk.PipelineViewportStateCreateInfo{
-        .flags = .{},
-        .viewport_count = 1,
-        .p_viewports = @ptrCast([*]const vk.Viewport, &viewport),
-        .scissor_count = 1,
-        .p_scissors = @ptrCast([*]const vk.Rect2D, &scissor),
-    };
-
-    const depth_stencil_info = vk.PipelineDepthStencilStateCreateInfo{
-        .flags = .{},
-        .depth_test_enable = vk.TRUE,
-        .depth_write_enable = vk.TRUE,
-        .depth_compare_op = .less_or_equal,
-        .depth_bounds_test_enable = vk.FALSE,
-        .stencil_test_enable = vk.FALSE,
-        .front = std.mem.zeroInit(vk.StencilOpState, .{}),
-        .back = std.mem.zeroInit(vk.StencilOpState, .{}),
-        .min_depth_bounds = 0.0,
-        .max_depth_bounds = 1.0,
-    };
-
-    const pipeline_info = vk.GraphicsPipelineCreateInfo{
-        .flags = .{},
-        .stage_count = stage_infos.len,
-        .p_stages = &stage_infos,
-        .p_vertex_input_state = &vertex_input_info,
-        .p_input_assembly_state = &input_assembly_info,
-        .p_tessellation_state = null,
-        .p_viewport_state = &viewport_info,
-        .p_rasterization_state = &rasterization_info,
-        .p_multisample_state = &msaa_info,
-        .p_depth_stencil_state = &depth_stencil_info,
-        .p_color_blend_state = &color_blend_info,
-        .p_dynamic_state = null,
-        .layout = layout,
-        .render_pass = render_pass,
-        .subpass = 0,
-        .base_pipeline_handle = .null_handle,
-        .base_pipeline_index = -1,
-    };
-
-    var pipeline: vk.Pipeline = undefined;
-    _ = try gc.vkd.createGraphicsPipelines(
-        gc.dev,
-        .null_handle,
-        1,
-        @ptrCast([*]const vk.GraphicsPipelineCreateInfo, &pipeline_info),
-        null,
-        @ptrCast([*]vk.Pipeline, &pipeline),
-    );
-    return pipeline;
-}
-
-test "load obj mesh" {
-    var mesh = Mesh.init(std.testing.allocator);
-    defer mesh.deinit();
-    try mesh.loadObj("C:/temp/test.obj");
 }

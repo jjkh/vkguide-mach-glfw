@@ -124,7 +124,6 @@ pub fn loadObj(self: *Mesh, filename: []const u8) !void {
         read_file,
         &file_alloc,
         c.TINYOBJ_FLAG_TRIANGULATE,
-        // 0,
     );
     if (ret != c.TINYOBJ_SUCCESS) return error.TinyObjParseError;
     log.debug("{} shapes ({*})", .{ shapes_count, shapes });
