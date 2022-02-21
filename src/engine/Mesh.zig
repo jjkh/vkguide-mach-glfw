@@ -6,7 +6,7 @@ const Mesh = @This();
 const std = @import("std");
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.Mesh);
+const log = std.log.scoped(.mesh);
 
 const vk = @import("vulkan");
 const zlm = @import("zlm");
