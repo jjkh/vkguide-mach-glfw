@@ -12,7 +12,9 @@ const Swapchain = @import("engine/swapchain.zig").Swapchain;
 
 const Mesh = @import("engine/Mesh.zig");
 const Buffer = @import("engine/Buffer.zig");
-const Frame = @import("engine/Frame.zig");
+const Frames = @import("engine/frames.zig").Frames;
+const Frame = @import("engine/frames.zig").Frame;
+const GpuCameraData = @import("engine/frames.zig").GpuCameraData;
 
 const vec3 = zlm.vec3;
 const Vec3 = zlm.Vec3;
@@ -206,8 +208,8 @@ pub fn main() !void {
     var fence = try gc.vkd.createFence(gc.dev, &.{ .flags = .{ .signaled_bit = true } }, null);
     defer gc.vkd.destroyFence(gc.dev, fence, null);
 
-    _ = try Frame.createAll(&gc, &vma);
-    defer Frame.freeAll(&gc, &vma);
+    var frames = try Frames(2).create(&gc, &vma);
+    defer frames.free();
 
     // define the mesh for the mesh shader pipeline
     var mesh = Mesh.init(allocator);
@@ -266,7 +268,7 @@ pub fn main() !void {
     const mesh_pipeline_layout = try gc.vkd.createPipelineLayout(gc.dev, &.{
         .flags = .{},
         .set_layout_count = 1,
-        .p_set_layouts = @ptrCast([*]const vk.DescriptorSetLayout, &Frame.global_set_layout.?),
+        .p_set_layouts = @ptrCast([*]const vk.DescriptorSetLayout, &frames.shared_data.global_set_layout),
         .push_constant_range_count = 1,
         .p_push_constant_ranges = @ptrCast([*]const vk.PushConstantRange, &push_constant),
     }, null);
@@ -310,7 +312,7 @@ pub fn main() !void {
     var frame_number: u32 = 0;
     // Wait for the user to close the window.
     while (!window.shouldClose()) : (frame_number += 1) {
-        const curr_frame = Frame.getCurrentFrame(frame_number);
+        const curr_frame = frames.currentFrame(frame_number);
 
         // wait until the GPU has finished rendering the last frame. Timeout of 1 second
         _ = try gc.vkd.waitForFences(gc.dev, 1, @ptrCast([*]vk.Fence, &fence), @boolToInt(true), 1_000_000_000);
@@ -374,7 +376,7 @@ pub fn main() !void {
 
             const rot_mat = Mat4.createAngleAxis(UP, zlm.toRadians(@intToFloat(f32, frame_number) * 0.01));
 
-            const cam_data = Frame.GpuCameraData{
+            const cam_data = GpuCameraData{
                 .proj = projection,
                 .view = view,
                 .view_proj = rot_mat.mul(view.mul(projection)),
