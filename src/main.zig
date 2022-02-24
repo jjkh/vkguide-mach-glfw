@@ -12,8 +12,6 @@ const zlm = @import("zlm");
 const GraphicsContext = @import("engine/graphics_context.zig").GraphicsContext;
 const Swapchain = @import("engine/swapchain.zig").Swapchain;
 
-const Image = @import("engine/Image.zig");
-
 const Mesh = @import("engine/Mesh.zig");
 const Buffer = @import("engine/Buffer.zig");
 
@@ -23,7 +21,7 @@ const GpuCameraData = @import("engine/frames.zig").GpuCameraData;
 
 const createPipeline = @import("engine/pipeline.zig").createPipeline;
 const createRenderPass = @import("engine/renderpass.zig").createRenderPass;
-const createFramebuffers = @import("engine/renderpass.zig").createFramebuffers;
+const Framebuffers = @import("engine/Framebuffers.zig");
 
 const vec3 = zlm.vec3;
 const Vec3 = zlm.Vec3;
@@ -126,7 +124,7 @@ pub fn main() !void {
     // all rendering commands must occur within a render pass
     // a render pass encapsulates the state required to setup the target for rendering,
     // and the state of the images being rendered
-    const render_pass = try createRenderPass(&gc, swapchain, .d32_sfloat);
+    const render_pass = try createRenderPass(&gc, swapchain.surface_format.format, .d32_sfloat);
     defer gc.vkd.destroyRenderPass(gc.dev, render_pass, null);
 
     // a pipeline turns data/programs into pixels
@@ -196,31 +194,10 @@ pub fn main() !void {
     );
     defer gc.vkd.destroyPipeline(gc.dev, mesh_pipeline, null);
 
-    // a depth image is required by the render pipeline to ensure the correct
-    // vertices (pixels?) are drawn on the top
-    // this is part of the depth buffer, and is used by the render pass as a
-    // depth attachment
-    var depth_image = try Image.create(
-        &gc,
-        &vma,
-        .d32_sfloat,
-        .{ .depth_stencil_attachment_bit = true },
-        .{ .depth_bit = true },
-        .{
-            .width = swapchain.extent.width,
-            .height = swapchain.extent.height,
-            .depth = 1,
-        },
-    );
-    defer depth_image.free(&gc, &vma);
-
     // framebuffers are created from a render pass, and are the link between the attachements
     // of a renderpass and the real images they should render to
-    var framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth_image.view);
-    defer {
-        for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
-        allocator.free(framebuffers);
-    }
+    var framebuffers = try Framebuffers.create(&gc, &vma, allocator, render_pass, swapchain);
+    defer framebuffers.free(&gc, &vma);
 
     // a fence is used to ensure the GPU has finished it's work before continuing
     var fence = try gc.vkd.createFence(gc.dev, &.{ .flags = .{ .signaled_bit = true } }, null);
@@ -244,15 +221,12 @@ pub fn main() !void {
         // now that we are sure that the commands finished executing, we can safely reset the command buffer to begin recording again
         try gc.vkd.resetCommandBuffer(curr_frame.cmd_buf, .{});
 
-        // TODO: fix this, doesn't work
-        // allows resizing smaller but not larger...
         if (need_resize) {
             const new_size = try window.getSize();
             try swapchain.recreate(.{ .width = new_size.width, .height = new_size.height });
 
-            for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
-            allocator.free(framebuffers);
-            framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain, depth_image.view);
+            framebuffers.free(&gc, &vma);
+            framebuffers = try Framebuffers.create(&gc, &vma, allocator, render_pass, swapchain);
 
             need_resize = false;
         }
@@ -277,7 +251,7 @@ pub fn main() !void {
 
         const rp_begin_info = vk.RenderPassBeginInfo{
             .render_pass = render_pass,
-            .framebuffer = framebuffers[image_index],
+            .framebuffer = framebuffers.buffers[image_index],
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = swapchain.extent },
             .clear_value_count = 2,
             .p_clear_values = &[_]vk.ClearValue{ clear_value, depth_clear },

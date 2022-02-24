@@ -1,15 +1,13 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 
 const vk = @import("vulkan");
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
-const Swapchain = @import("swapchain.zig").Swapchain;
 
-pub fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain, depth_format: vk.Format) !vk.RenderPass {
+pub fn createRenderPass(gc: *const GraphicsContext, format: vk.Format, depth_format: vk.Format) !vk.RenderPass {
     // the renderpass will use this color attachment
     const color_attachment = vk.AttachmentDescription{
         .flags = .{},
-        .format = swapchain.surface_format.format,
+        .format = format,
         // 1 sample, we won't be doing MSAA
         .samples = .{ .@"1_bit" = true },
         .load_op = .clear,
@@ -88,33 +86,4 @@ pub fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain, depth_
         .dependency_count = 2,
         .p_dependencies = &[_]vk.SubpassDependency{ dependency, depth_dependency },
     }, null);
-}
-
-pub fn createFramebuffers(
-    gc: *const GraphicsContext,
-    allocator: Allocator,
-    render_pass: vk.RenderPass,
-    swapchain: Swapchain,
-    depth_image_view: vk.ImageView,
-) ![]vk.Framebuffer {
-    const framebuffers = try allocator.alloc(vk.Framebuffer, swapchain.swap_images.len);
-    errdefer allocator.free(framebuffers);
-
-    var i: usize = 0;
-    errdefer for (framebuffers[0..i]) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
-
-    for (framebuffers) |*fb| {
-        fb.* = try gc.vkd.createFramebuffer(gc.dev, &.{
-            .flags = .{},
-            .render_pass = render_pass,
-            .attachment_count = 2,
-            .p_attachments = &[_]vk.ImageView{ swapchain.swap_images[i].view, depth_image_view },
-            .width = swapchain.extent.width,
-            .height = swapchain.extent.height,
-            .layers = 1,
-        }, null);
-        i += 1;
-    }
-
-    return framebuffers;
 }
