@@ -46,7 +46,6 @@ pub fn main() !void {
     try glfw.init(.{});
     errdefer glfw.terminate();
 
-    // TODO: support resizing
     // TODO: account for HiDPI
     // window size
     var extent = vk.Extent2D{ .width = 800, .height = 600 };
@@ -210,6 +209,13 @@ pub fn main() !void {
     var frame_number: u32 = 0;
     var need_resize = false;
     while (!window.shouldClose()) : (frame_number += 1) {
+        // check if minimized
+        var curr_size = try window.getFramebufferSize();
+        if (curr_size.width == 0 and curr_size.height == 0) {
+            try glfw.waitEvents();
+            continue;
+        }
+
         // get the current frame to ensure the correct data buffers are being written to
         // this also gets the correct semaphores to ensure we're waiting on the correct operations
         const curr_frame = frames.currentFrame(frame_number);
@@ -222,11 +228,9 @@ pub fn main() !void {
         try gc.vkd.resetCommandBuffer(curr_frame.cmd_buf, .{});
 
         if (need_resize) {
-            const new_size = try window.getSize();
-            try swapchain.recreate(.{ .width = new_size.width, .height = new_size.height });
-
-            framebuffers.free(&gc, &vma);
-            framebuffers = try Framebuffers.create(&gc, &vma, allocator, render_pass, swapchain);
+            const new_size = @bitCast(vk.Extent2D, try window.getSize());
+            try swapchain.recreate(new_size);
+            try framebuffers.recreate(&gc, &vma, render_pass, swapchain);
 
             need_resize = false;
         }
